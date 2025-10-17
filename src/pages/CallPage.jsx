@@ -94,14 +94,14 @@ const CallPage = () => {
   const [inputVolume, setInputVolume] = useState(0);
 
   const isChecklistComplete = checklist.every((item) => item.status !== 'pending');
-  //const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
-  const AGORA_APP_ID = "4b7634a0d0f1418b8135918292f6a507";
-  //const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL || 'checklist-session';
-  const AGORA_CHANNEL = "zilingchecklist";
-  //const AGORA_TOKEN = import.meta.env.VITE_AGORA_TOKEN || null;
-  const AGORA_TOKEN = null;
-  //const AGORA_UID = import.meta.env.VITE_AGORA_UID ? Number(import.meta.env.VITE_AGORA_UID) : null;
-  const AGORA_UID =999;
+  const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
+  //const AGORA_APP_ID = "4b7634a0d0f1418b8135918292f6a507";
+  const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL || 'checklist-session';
+  //const AGORA_CHANNEL = "zilingchecklist";
+  const AGORA_TOKEN = import.meta.env.VITE_AGORA_TOKEN || null;
+  //const AGORA_TOKEN = null;
+  const AGORA_UID = import.meta.env.VITE_AGORA_UID ? Number(import.meta.env.VITE_AGORA_UID) : null;
+  //const AGORA_UID =999;
 
   useEffect(() => {
     const canSynthesize = 'speechSynthesis' in window;
