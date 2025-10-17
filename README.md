@@ -33,6 +33,21 @@ npm run build
 npm run preview
 ```
 
+## Agora Setup
+
+The call experience now joins an Agora RTC channel for live audio. Provide your credentials though
+Vite environment variables (for local development create a `.env.local`):
+
+```
+VITE_AGORA_APP_ID=your-app-id
+VITE_AGORA_CHANNEL=checklist-session   # optional, defaults to "checklist-session"
+VITE_AGORA_TOKEN=your-temporary-token  # optional when the project enables app certificate-less access
+VITE_AGORA_UID=12345                   # optional, Agora assigns one automatically when omitted
+```
+
+Restart the dev server after changing these values. The UI surfaces connection issues through the
+device status banner and continues to use the existing Web Speech pipeline.
+
 ## Integrating Agora or Other AI Backends
 
 - `src/pages/CallPage.jsx` contains an `evaluateResponse` helper that currently mocks AI scoring. Replace this function with an async call to your Agora Conversational AI endpoint, returning the checklist status, recommendation, and AI response text.
