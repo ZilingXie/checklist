@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import AgoraRTC from 'agora-rtc-sdk-ng';
 import { useNavigate } from 'react-router-dom';
 import CallStatusBar from '../components/CallStatusBar.jsx';
 import ConversationVisualizer from '../components/ConversationVisualizer.jsx';
@@ -69,13 +70,15 @@ const evaluateResponse = async ({ userText, item, nextItem }) => {
 const CallPage = () => {
   const navigate = useNavigate();
   const recognitionRef = useRef(null);
-  const mediaStreamRef = useRef(null);
   const devicePermissionRequestedRef = useRef(false);
   const audioContextRef = useRef(null);
   const audioSourceRef = useRef(null);
   const analyserRef = useRef(null);
   const volumeAnimationRef = useRef(null);
   const hasGreetedRef = useRef(false);
+  const agoraClientRef = useRef(null);
+  const localAudioTrackRef = useRef(null);
+  const remoteAudioContainerRef = useRef(null);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('connected');
   const [statusLabel, setStatusLabel] = useState('AI Assistant - Connected');
@@ -91,6 +94,14 @@ const CallPage = () => {
   const [inputVolume, setInputVolume] = useState(0);
 
   const isChecklistComplete = checklist.every((item) => item.status !== 'pending');
+  //const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
+  const AGORA_APP_ID = "4b7634a0d0f1418b8135918292f6a507";
+  //const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL || 'checklist-session';
+  const AGORA_CHANNEL = "zilingchecklist";
+  //const AGORA_TOKEN = import.meta.env.VITE_AGORA_TOKEN || null;
+  const AGORA_TOKEN = null;
+  //const AGORA_UID = import.meta.env.VITE_AGORA_UID ? Number(import.meta.env.VITE_AGORA_UID) : null;
+  const AGORA_UID =999;
 
   useEffect(() => {
     const canSynthesize = 'speechSynthesis' in window;
@@ -130,19 +141,91 @@ const CallPage = () => {
 
     recognitionRef.current = recognition;
     greetAndStart();
-    applySelectedInput('default', { silent: true }).catch(() => {});
+
+    let isActive = true;
+
+    const initializeAgora = async () => {
+      if (!AGORA_APP_ID) {
+        setDeviceStatusMessage('Set VITE_AGORA_APP_ID to enable live audio streaming.');
+        return;
+      }
+
+      const client = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
+      agoraClientRef.current = client;
+
+      client.on('user-published', async (user, mediaType) => {
+        if (mediaType !== 'audio') return;
+        try {
+          await client.subscribe(user, mediaType);
+          const container = remoteAudioContainerRef.current;
+          if (container) {
+            user.audioTrack?.play(container);
+          } else {
+            user.audioTrack?.play();
+          }
+        } catch (error) {
+          console.error('Failed to subscribe to remote audio', error);
+        }
+      });
+
+      client.on('user-unpublished', (user, mediaType) => {
+        if (mediaType !== 'audio') return;
+        try {
+          user.audioTrack?.stop();
+        } catch (error) {
+          console.error('Failed to stop remote audio track', error);
+        }
+      });
+
+      try {
+        setDeviceStatusMessage('Connecting to live audio…');
+        await ensureDeviceAccess();
+        await client.join(AGORA_APP_ID, AGORA_CHANNEL, AGORA_TOKEN, AGORA_UID ?? undefined);
+        const trackConfig =
+          selectedDeviceId === 'default' ? {} : { microphoneId: selectedDeviceId };
+        const localTrack = await AgoraRTC.createMicrophoneAudioTrack(trackConfig);
+        localAudioTrackRef.current = localTrack;
+        await client.publish(localTrack);
+        await applySelectedInput(selectedDeviceId, { silent: true });
+        if (!isActive) return;
+        setDeviceStatusMessage('');
+      } catch (error) {
+        console.error('Agora initialization failed', error);
+        if (!isActive) return;
+        setDeviceStatusMessage(
+          'Unable to connect to Agora. Verify credentials and network connectivity.'
+        );
+      }
+    };
+
+    initializeAgora();
 
     return () => {
       recognition.stop();
       window.speechSynthesis.cancel();
       stopVolumeMonitor();
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      if (localAudioTrackRef.current) {
+        try {
+          localAudioTrackRef.current.stop();
+          localAudioTrackRef.current.close();
+        } catch (error) {
+          console.error('Failed to close local Agora track', error);
+        }
+        localAudioTrackRef.current = null;
+      }
+      if (agoraClientRef.current) {
+        const client = agoraClientRef.current;
+        client.removeAllListeners();
+        client.leave().catch((error) => {
+          console.error('Failed to leave Agora channel', error);
+        });
+        agoraClientRef.current = null;
       }
       if (audioContextRef.current) {
         audioContextRef.current.close?.();
         audioContextRef.current = null;
       }
+      isActive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -266,9 +349,10 @@ const CallPage = () => {
   };
 
   const applySelectedInput = async (deviceId, { silent = false } = {}) => {
-    if (!navigator?.mediaDevices?.getUserMedia) {
+    const localTrack = localAudioTrackRef.current;
+    if (!localTrack) {
       if (!silent) {
-        setDeviceStatusMessage('Device switching is not supported in this browser.');
+        setDeviceStatusMessage('Live audio is not ready yet. Please wait a moment and try again.');
       }
       return false;
     }
@@ -277,22 +361,13 @@ const CallPage = () => {
       if (!silent) {
         setDeviceStatusMessage('Switching input device…');
       }
-      const constraints =
-        deviceId === 'default'
-          ? { audio: true }
-          : {
-              audio: {
-                deviceId: { exact: deviceId }
-              }
-            };
 
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      await localTrack.setDevice(deviceId === 'default' ? 'default' : deviceId);
+      const mediaStreamTrack = localTrack.getMediaStreamTrack?.();
+      if (mediaStreamTrack) {
+        const stream = new MediaStream([mediaStreamTrack]);
+        await startVolumeMonitor(stream);
       }
-      mediaStreamRef.current = stream;
-      devicePermissionRequestedRef.current = true;
-      await startVolumeMonitor(stream);
       setSelectedDeviceId(deviceId);
       if (!silent) {
         setDeviceStatusMessage('Microphone updated.');
@@ -458,13 +533,26 @@ const CallPage = () => {
     stopListening();
     window.speechSynthesis.cancel();
     stopVolumeMonitor();
+    if (localAudioTrackRef.current) {
+      try {
+        localAudioTrackRef.current.stop();
+        localAudioTrackRef.current.close();
+      } catch (error) {
+        console.error('Failed to close local Agora track on end call', error);
+      }
+      localAudioTrackRef.current = null;
+    }
+    if (agoraClientRef.current) {
+      const client = agoraClientRef.current;
+      client.removeAllListeners();
+      client.leave().catch((error) => {
+        console.error('Failed to leave Agora channel on end call', error);
+      });
+      agoraClientRef.current = null;
+    }
     if (audioContextRef.current) {
       audioContextRef.current.close?.();
       audioContextRef.current = null;
-    }
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-      mediaStreamRef.current = null;
     }
     setIsDeviceMenuOpen(false);
     navigate('/');
@@ -513,6 +601,7 @@ const CallPage = () => {
         deviceStatusMessage={deviceStatusMessage}
         inputVolume={inputVolume}
       />
+      <div ref={remoteAudioContainerRef} className="sr-only" aria-hidden="true" />
     </div>
   );
 };
