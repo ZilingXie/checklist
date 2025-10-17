@@ -75,6 +75,7 @@ const CallPage = () => {
   const audioSourceRef = useRef(null);
   const analyserRef = useRef(null);
   const volumeAnimationRef = useRef(null);
+  const hasGreetedRef = useRef(false);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('connected');
   const [statusLabel, setStatusLabel] = useState('AI Assistant - Connected');
@@ -321,8 +322,10 @@ const CallPage = () => {
   };
 
   const greetAndStart = () => {
-    if (!callActive) return;
+    if (!callActive || hasGreetedRef.current) return;
+    hasGreetedRef.current = true;
     const firstItem = checklist[0];
+    if (!firstItem) return;
     const intro = `Welcome to the checklist review. Let's begin with the first item. ${firstItem.question}`;
 
     addConversationMessage('ai', intro);
