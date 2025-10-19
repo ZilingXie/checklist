@@ -1,6 +1,110 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 
+const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
+const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
+const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN ?? '';
+const AGORA_AGENT_AUTH = import.meta.env.VITE_AGORA_AGENT_AUTH;
+const AGORA_AGENT_JOIN_URL =
+  import.meta.env.VITE_AGORA_AGENT_JOIN_URL ||
+  (AGORA_APP_ID
+    ? `https://api.agora.io/api/conversational-ai-agent/v2/projects/${AGORA_APP_ID}/join`
+    : undefined);
+const AGORA_AGENT_NAME = import.meta.env.VITE_AGORA_AGENT_NAME ?? 'checklist-agent';
+const AGORA_AGENT_RTC_UID = import.meta.env.VITE_AGORA_AGENT_RTC_UID ?? '0';
+const AGORA_AGENT_REMOTE_UIDS = import.meta.env.VITE_AGORA_AGENT_REMOTE_UIDS ?? '*';
+const AGORA_AGENT_ENABLE_STRING_UID =
+  (import.meta.env.VITE_AGORA_AGENT_ENABLE_STRING_UID ?? 'false').toLowerCase() === 'true';
+const AGORA_AGENT_IDLE_TIMEOUT = Number.parseInt(
+  import.meta.env.VITE_AGORA_AGENT_IDLE_TIMEOUT ?? '',
+  10
+);
+const AGORA_AGENT_ASR_LANGUAGE = import.meta.env.VITE_AGORA_AGENT_ASR_LANGUAGE ?? 'en-US';
+const AGORA_AGENT_LLM_URL =
+  import.meta.env.VITE_AGORA_AGENT_LLM_URL ?? 'https://api.openai.com/v1/chat/completions';
+const AGORA_AGENT_LLM_API_KEY = import.meta.env.VITE_AGORA_AGENT_LLM_API_KEY;
+const AGORA_AGENT_LLM_MODEL = import.meta.env.VITE_AGORA_AGENT_LLM_MODEL ?? 'gpt-4o-mini';
+const AGORA_AGENT_SYSTEM_MESSAGE =
+  import.meta.env.VITE_AGORA_AGENT_SYSTEM_MESSAGE ?? 'You are a helpful chatbot.';
+const AGORA_AGENT_GREETING_MESSAGE =
+  import.meta.env.VITE_AGORA_AGENT_GREETING_MESSAGE ?? 'Hello, how can I help you?';
+const AGORA_AGENT_FAILURE_MESSAGE =
+  import.meta.env.VITE_AGORA_AGENT_FAILURE_MESSAGE ??
+  "Sorry, I don't know how to answer this question.";
+const AGORA_AGENT_LLM_MAX_HISTORY = Number.parseInt(
+  import.meta.env.VITE_AGORA_AGENT_LLM_MAX_HISTORY ?? '',
+  10
+);
+const AGORA_AGENT_TTS_VENDOR = import.meta.env.VITE_AGORA_AGENT_TTS_VENDOR ?? 'microsoft';
+const AGORA_AGENT_TTS_KEY = import.meta.env.VITE_AGORA_AGENT_TTS_KEY;
+const AGORA_AGENT_TTS_REGION = import.meta.env.VITE_AGORA_AGENT_TTS_REGION ?? 'eastus';
+const AGORA_AGENT_TTS_VOICE =
+  import.meta.env.VITE_AGORA_AGENT_TTS_VOICE ?? 'en-US-AndrewMultilingualNeural';
+
+const parseRemoteRtcUids = (value) => {
+  if (!value) return ['*'];
+  const parsed = value
+    .split(',')
+    .map((uid) => uid.trim())
+    .filter(Boolean);
+  return parsed.length > 0 ? parsed : ['*'];
+};
+
+const resolveIdleTimeout = () =>
+  Number.isFinite(AGORA_AGENT_IDLE_TIMEOUT) ? AGORA_AGENT_IDLE_TIMEOUT : 120;
+
+const resolveMaxHistory = () =>
+  Number.isFinite(AGORA_AGENT_LLM_MAX_HISTORY) ? AGORA_AGENT_LLM_MAX_HISTORY : 10;
+
+const buildAgentJoinPayload = () => {
+  const properties = {
+    channel: AGORA_CHANNEL,
+    token: AGORA_TOKEN ?? '',
+    agent_rtc_uid: AGORA_AGENT_RTC_UID,
+    remote_rtc_uids: parseRemoteRtcUids(AGORA_AGENT_REMOTE_UIDS),
+    enable_string_uid: AGORA_AGENT_ENABLE_STRING_UID,
+    idle_timeout: resolveIdleTimeout(),
+    asr: {
+      language: AGORA_AGENT_ASR_LANGUAGE
+    }
+  };
+
+  if (AGORA_AGENT_LLM_API_KEY) {
+    properties.llm = {
+      url: AGORA_AGENT_LLM_URL,
+      api_key: AGORA_AGENT_LLM_API_KEY,
+      system_messages: [
+        {
+          role: 'system',
+          content: AGORA_AGENT_SYSTEM_MESSAGE
+        }
+      ],
+      greeting_message: AGORA_AGENT_GREETING_MESSAGE,
+      failure_message: AGORA_AGENT_FAILURE_MESSAGE,
+      max_history: resolveMaxHistory(),
+      params: {
+        model: AGORA_AGENT_LLM_MODEL
+      }
+    };
+  }
+
+  if (AGORA_AGENT_TTS_KEY) {
+    properties.tts = {
+      vendor: AGORA_AGENT_TTS_VENDOR,
+      params: {
+        key: AGORA_AGENT_TTS_KEY,
+        region: AGORA_AGENT_TTS_REGION,
+        voice_name: AGORA_AGENT_TTS_VOICE
+      }
+    };
+  }
+
+  return {
+    name: AGORA_AGENT_NAME,
+    properties
+  };
+};
+
 const LandingPage = () => {
   const overviewRef = useRef(null);
   const highlightTimeoutRef = useRef(null);
@@ -33,6 +137,52 @@ const LandingPage = () => {
     }, 1600);
   };
 
+  const sendAgentJoinRequest = async () => {
+    if (!AGORA_AGENT_JOIN_URL || !AGORA_AGENT_AUTH) {
+      console.warn('Missing Agora agent join configuration. Skipping agent join request.');
+      return;
+    }
+
+    if (!AGORA_CHANNEL) {
+      console.warn('Missing Agora channel. Skipping agent join request.');
+      return;
+    }
+
+    if (typeof fetch !== 'function') {
+      console.warn('Fetch API unavailable. Skipping agent join request.');
+      return;
+    }
+
+    const payload = buildAgentJoinPayload();
+
+    try {
+      const response = await fetch(AGORA_AGENT_JOIN_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Basic ${AGORA_AGENT_AUTH}`
+        },
+        body: JSON.stringify(payload),
+        keepalive: true
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Agora agent join request failed', {
+          status: response.status,
+          statusText: response.statusText,
+          body: errorText
+        });
+      }
+    } catch (error) {
+      console.error('Failed to invoke Agora agent join request', error);
+    }
+  };
+
+  const handleJoinCallClick = () => {
+    void sendAgentJoinRequest();
+  };
+
   return (
     <div className="relative min-h-screen overflow-hidden bg-gradient-to-br from-slate-925 via-slate-900 to-brand-700">
       <div className="absolute inset-0 opacity-40">
@@ -55,6 +205,7 @@ const LandingPage = () => {
           <Link
             to="/call"
             className="rounded-full bg-white px-8 py-3 text-base font-semibold text-slate-925 shadow-lg shadow-brand-700/40 transition hover:translate-y-0.5 hover:bg-brand-500 hover:text-white"
+            onClick={handleJoinCallClick}
           >
             Join Call
           </Link>
