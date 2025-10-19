@@ -75,20 +75,24 @@ const CallControls = ({
                 No audio input devices detected.
               </p>
             ) : (
-              devices.map((device) => (
-                <button
-                  key={device.deviceId}
-                  type="button"
-                  onClick={() => onSelectDevice(device.deviceId)}
-                  className={`rounded-lg border px-4 py-2 text-left text-sm transition ${
-                    selectedDeviceId === device.deviceId
-                      ? 'border-brand-500 bg-brand-500/30 text-white'
-                      : 'border-white/10 bg-white/5 text-white/80 hover:bg-white/10'
-                  }`}
-                >
-                  {device.label}
-                </button>
-              ))
+              devices.map((device, index) => {
+                const deviceKey = `${device.deviceId || 'unknown'}-${device.label || index}`;
+
+                return (
+                  <button
+                    key={deviceKey}
+                    type="button"
+                    onClick={() => onSelectDevice(device.deviceId)}
+                    className={`rounded-lg border px-4 py-2 text-left text-sm transition ${
+                      selectedDeviceId === device.deviceId
+                        ? 'border-brand-500 bg-brand-500/30 text-white'
+                        : 'border-white/10 bg-white/5 text-white/80 hover:bg-white/10'
+                    }`}
+                  >
+                    {device.label}
+                  </button>
+                );
+              })
             )}
           </div>
         </div>

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import AgoraRTC from 'agora-rtc-sdk-ng';
 import { useNavigate } from 'react-router-dom';
+import AgoraRTC from 'agora-rtc-sdk-ng';
 import CallStatusBar from '../components/CallStatusBar.jsx';
 import ConversationVisualizer from '../components/ConversationVisualizer.jsx';
 import TranscriptPanel from '../components/TranscriptPanel.jsx';
@@ -67,6 +67,12 @@ const evaluateResponse = async ({ userText, item, nextItem }) => {
   };
 };
 
+const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
+const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
+const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN || null;
+const parsedAgoraUid = Number.parseInt(import.meta.env.VITE_AGORA_UID ?? '', 10);
+const AGORA_UID = Number.isFinite(parsedAgoraUid) ? parsedAgoraUid : null;
+
 const CallPage = () => {
   const navigate = useNavigate();
   const recognitionRef = useRef(null);
@@ -76,9 +82,12 @@ const CallPage = () => {
   const analyserRef = useRef(null);
   const volumeAnimationRef = useRef(null);
   const hasGreetedRef = useRef(false);
+  const localStreamRef = useRef(null);
+  const isComponentMountedRef = useRef(true);
   const agoraClientRef = useRef(null);
-  const localAudioTrackRef = useRef(null);
-  const remoteAudioContainerRef = useRef(null);
+  const agoraLocalAudioTrackRef = useRef(null);
+  const remoteAudioTracksRef = useRef(new Map());
+  const agoraSessionContextRef = useRef(null);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('connected');
   const [statusLabel, setStatusLabel] = useState('AI Assistant - Connected');
@@ -89,21 +98,21 @@ const CallPage = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [audioDevices, setAudioDevices] = useState([{ deviceId: 'default', label: 'System Default' }]);
   const [selectedDeviceId, setSelectedDeviceId] = useState('default');
+  const selectedDeviceIdRef = useRef('default');
   const [isDeviceMenuOpen, setIsDeviceMenuOpen] = useState(false);
   const [deviceStatusMessage, setDeviceStatusMessage] = useState('');
   const [inputVolume, setInputVolume] = useState(0);
+  const [agoraJoined, setAgoraJoined] = useState(false);
 
   const isChecklistComplete = checklist.every((item) => item.status !== 'pending');
-  const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
-  //const AGORA_APP_ID = "4b7634a0d0f1418b8135918292f6a507";
-  const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL || 'checklist-session';
-  //const AGORA_CHANNEL = "zilingchecklist";
-  const AGORA_TOKEN = import.meta.env.VITE_AGORA_TOKEN || null;
-  //const AGORA_TOKEN = null;
-  const AGORA_UID = import.meta.env.VITE_AGORA_UID ? Number(import.meta.env.VITE_AGORA_UID) : null;
-  //const AGORA_UID =999;
 
   useEffect(() => {
+    selectedDeviceIdRef.current = selectedDeviceId;
+  }, [selectedDeviceId]);
+
+  useEffect(() => {
+    isComponentMountedRef.current = true;
+
     const canSynthesize = 'speechSynthesis' in window;
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
@@ -143,84 +152,90 @@ const CallPage = () => {
     greetAndStart();
 
     let isActive = true;
+    const client = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
+    agoraClientRef.current = client;
+    const remoteTracksForSession = new Map();
+    remoteAudioTracksRef.current = remoteTracksForSession;
+    const sessionContext = { client, remoteTracks: remoteTracksForSession, localTrack: null };
+    agoraSessionContextRef.current = sessionContext;
 
-    const initializeAgora = async () => {
-      if (!AGORA_APP_ID) {
-        setDeviceStatusMessage('Set VITE_AGORA_APP_ID to enable live audio streaming.');
+    const handleRemoteAudioPublished = async (user, mediaType) => {
+      if (!isActive || mediaType !== 'audio') {
         return;
       }
 
-      const client = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
-      agoraClientRef.current = client;
-
-      client.on('user-published', async (user, mediaType) => {
-        if (mediaType !== 'audio') return;
-        try {
-          await client.subscribe(user, mediaType);
-          const container = remoteAudioContainerRef.current;
-          if (container) {
-            user.audioTrack?.play(container);
-          } else {
-            user.audioTrack?.play();
-          }
-        } catch (error) {
-          console.error('Failed to subscribe to remote audio', error);
-        }
-      });
-
-      client.on('user-unpublished', (user, mediaType) => {
-        if (mediaType !== 'audio') return;
-        try {
-          user.audioTrack?.stop();
-        } catch (error) {
-          console.error('Failed to stop remote audio track', error);
-        }
-      });
+      const activeClient = agoraClientRef.current;
+      if (!activeClient) return;
 
       try {
-        setDeviceStatusMessage('Connecting to live audio…');
-        await ensureDeviceAccess();
-        await client.join(AGORA_APP_ID, AGORA_CHANNEL, AGORA_TOKEN, AGORA_UID ?? undefined);
-        const trackConfig =
-          selectedDeviceId === 'default' ? {} : { microphoneId: selectedDeviceId };
-        const localTrack = await AgoraRTC.createMicrophoneAudioTrack(trackConfig);
-        localAudioTrackRef.current = localTrack;
-        await client.publish(localTrack);
-        await applySelectedInput(selectedDeviceId, { silent: true });
-        if (!isActive) return;
-        setDeviceStatusMessage('');
+        await activeClient.subscribe(user, mediaType);
+        const remoteAudioTrack = user.audioTrack;
+        remoteAudioTrack?.play();
+        remoteTracksForSession.set(user.uid, remoteAudioTrack);
       } catch (error) {
-        console.error('Agora initialization failed', error);
-        if (!isActive) return;
-        setDeviceStatusMessage(
-          'Unable to connect to Agora. Verify credentials and network connectivity.'
-        );
+        console.error('Failed to subscribe to remote audio', error);
       }
     };
 
-    initializeAgora();
+    const handleRemoteAudioRemoved = (user) => {
+      const remoteTrack = remoteTracksForSession.get(user.uid);
+      if (remoteTrack) {
+        try {
+          remoteTrack.stop();
+        } catch (error) {
+          console.error('Failed to stop remote Agora track', error);
+        }
+        remoteTracksForSession.delete(user.uid);
+      }
+    };
+
+    client.on('user-published', handleRemoteAudioPublished);
+    client.on('user-unpublished', handleRemoteAudioRemoved);
+    client.on('user-left', handleRemoteAudioRemoved);
+
+    const initializeLocalAudio = async () => {
+      if (!navigator?.mediaDevices?.getUserMedia) {
+        setDeviceStatusMessage('Microphone access is not supported in this browser.');
+        return;
+      }
+
+      try {
+        await ensureDeviceAccess();
+        await updateDeviceList();
+        const applied = await applySelectedInput(selectedDeviceId, { silent: true });
+        if (!isActive) {
+          return;
+        }
+        setDeviceStatusMessage((previous) =>
+          applied ? '' : previous || 'Unable to access microphone. Check permissions and try again.'
+        );
+      } catch (error) {
+        console.error('Microphone initialization failed', error);
+        if (!isActive) return;
+        setDeviceStatusMessage('Unable to access microphone. Check permissions and try again.');
+      }
+    };
+
+    initializeLocalAudio()
+      .catch(() => {
+        // already handled above
+      })
+      .finally(() => {
+        if (isActive) {
+          joinAgoraVoiceCall(sessionContext);
+        }
+      });
 
     return () => {
       recognition.stop();
       window.speechSynthesis.cancel();
       stopVolumeMonitor();
-      if (localAudioTrackRef.current) {
-        try {
-          localAudioTrackRef.current.stop();
-          localAudioTrackRef.current.close();
-        } catch (error) {
-          console.error('Failed to close local Agora track', error);
-        }
-        localAudioTrackRef.current = null;
-      }
-      if (agoraClientRef.current) {
-        const client = agoraClientRef.current;
-        client.removeAllListeners();
-        client.leave().catch((error) => {
-          console.error('Failed to leave Agora channel', error);
-        });
-        agoraClientRef.current = null;
-      }
+      stopLocalStream();
+      client.off('user-published', handleRemoteAudioPublished);
+      client.off('user-unpublished', handleRemoteAudioRemoved);
+      client.off('user-left', handleRemoteAudioRemoved);
+      isComponentMountedRef.current = false;
+      void leaveAgoraVoiceCall(sessionContext);
       if (audioContextRef.current) {
         audioContextRef.current.close?.();
         audioContextRef.current = null;
@@ -281,6 +296,156 @@ const CallPage = () => {
     }
     analyserRef.current = null;
     setInputVolume(0);
+  };
+
+  const stopLocalStream = () => {
+    if (!localStreamRef.current) return;
+    const tracks = localStreamRef.current.getTracks?.() ?? [];
+    tracks.forEach((track) => {
+      try {
+        track.stop();
+      } catch (error) {
+        console.error('Failed to stop local media track', error);
+      }
+    });
+    localStreamRef.current = null;
+  };
+
+  const leaveAgoraVoiceCall = async (sessionContext = agoraSessionContextRef.current) => {
+    const client = sessionContext?.client ?? agoraClientRef.current;
+    const tracks = sessionContext?.remoteTracks ?? remoteAudioTracksRef.current;
+    const localTrack = sessionContext?.localTrack ?? agoraLocalAudioTrackRef.current;
+
+    if (localTrack) {
+      try {
+        localTrack.stop();
+        localTrack.close();
+      } catch (error) {
+        console.error('Failed to clean up local Agora track', error);
+      }
+      if (sessionContext) {
+        sessionContext.localTrack = null;
+      }
+      if (agoraLocalAudioTrackRef.current === localTrack) {
+        agoraLocalAudioTrackRef.current = null;
+      }
+    }
+
+    tracks?.forEach((remoteTrack, uid) => {
+      try {
+        remoteTrack.stop();
+      } catch (error) {
+        console.error(`Failed to stop remote Agora track for user ${uid}`, error);
+      }
+    });
+    tracks?.clear();
+    if (tracks && remoteAudioTracksRef.current === tracks) {
+      remoteAudioTracksRef.current = new Map();
+    }
+
+    if (client) {
+      try {
+        await client.leave();
+      } catch (error) {
+        console.error('Failed to leave Agora client', error);
+      }
+      client.removeAllListeners?.();
+    }
+
+    if (agoraClientRef.current === client) {
+      agoraClientRef.current = null;
+      if (isComponentMountedRef.current) {
+        setAgoraJoined(false);
+      }
+    }
+    if (sessionContext && agoraSessionContextRef.current === sessionContext) {
+      agoraSessionContextRef.current = null;
+    }
+  };
+
+  const joinAgoraVoiceCall = async (sessionContext = agoraSessionContextRef.current) => {
+    if (!callActive) return;
+    if (!AGORA_APP_ID || !AGORA_CHANNEL) {
+      console.warn('Missing Agora credentials. Voice call join skipped.');
+      return;
+    }
+
+    if (agoraJoined) return;
+
+    try {
+      await ensureDeviceAccess();
+    } catch (error) {
+      console.error('Microphone permission is required for Agora voice call', error);
+      setDeviceStatusMessage('Allow microphone access to join the voice call.');
+      return;
+    }
+
+    const client = sessionContext?.client ?? agoraClientRef.current;
+    if (sessionContext && agoraSessionContextRef.current !== sessionContext) {
+      console.warn('Agora session context changed before join completed; aborting join.');
+      return;
+    }
+    if (!client) {
+      console.error('Agora client is not initialized.');
+      return;
+    }
+    if (agoraClientRef.current !== client) {
+      console.warn('Agora client changed before join completed; aborting join.');
+      return;
+    }
+
+    try {
+      await client.join(AGORA_APP_ID, AGORA_CHANNEL, AGORA_TOKEN || null, AGORA_UID ?? null);
+      const trackConfig =
+        selectedDeviceIdRef.current && selectedDeviceIdRef.current !== 'default'
+          ? { microphoneId: selectedDeviceIdRef.current }
+          : undefined;
+      const localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack(trackConfig);
+      agoraLocalAudioTrackRef.current = localAudioTrack;
+      if (sessionContext) {
+        sessionContext.localTrack = localAudioTrack;
+      }
+      await client.publish([localAudioTrack]);
+      setAgoraJoined(true);
+      setDeviceStatusMessage('');
+    } catch (error) {
+      console.error('Failed to join Agora voice call', error);
+      setDeviceStatusMessage('Unable to join the voice call. Check Agora configuration or permissions.');
+    }
+  };
+
+  const updateAgoraAudioDevice = async (deviceId) => {
+    if (!agoraJoined) return true;
+    const client = agoraClientRef.current;
+    const localTrack = agoraLocalAudioTrackRef.current;
+    if (!client || !localTrack) return false;
+
+    const requestedId = deviceId === 'default' ? 'default' : deviceId;
+
+    try {
+      await localTrack.setDevice(requestedId);
+      return true;
+    } catch (error) {
+      console.error('Direct Agora microphone switch failed, attempting rebuild', error);
+      try {
+        await client.unpublish([localTrack]);
+        localTrack.stop();
+        localTrack.close();
+      } catch (cleanupError) {
+        console.error('Failed to unpublish existing Agora track during switch', cleanupError);
+      }
+
+      try {
+        const trackConfig = deviceId === 'default' ? undefined : { microphoneId: deviceId };
+        const newTrack = await AgoraRTC.createMicrophoneAudioTrack(trackConfig);
+        agoraLocalAudioTrackRef.current = newTrack;
+        await client.publish([newTrack]);
+        return true;
+      } catch (fallbackError) {
+        console.error('Failed to rebuild Agora microphone track', fallbackError);
+        return false;
+      }
+    }
   };
 
   const startVolumeMonitor = async (stream) => {
@@ -349,10 +514,9 @@ const CallPage = () => {
   };
 
   const applySelectedInput = async (deviceId, { silent = false } = {}) => {
-    const localTrack = localAudioTrackRef.current;
-    if (!localTrack) {
+    if (!navigator?.mediaDevices?.getUserMedia) {
       if (!silent) {
-        setDeviceStatusMessage('Live audio is not ready yet. Please wait a moment and try again.');
+        setDeviceStatusMessage('Microphone selection is not supported in this browser.');
       }
       return false;
     }
@@ -362,13 +526,37 @@ const CallPage = () => {
         setDeviceStatusMessage('Switching input device…');
       }
 
-      await localTrack.setDevice(deviceId === 'default' ? 'default' : deviceId);
-      const mediaStreamTrack = localTrack.getMediaStreamTrack?.();
-      if (mediaStreamTrack) {
-        const stream = new MediaStream([mediaStreamTrack]);
-        await startVolumeMonitor(stream);
-      }
+      const constraints =
+        deviceId === 'default'
+          ? { audio: true }
+          : { audio: { deviceId: { exact: deviceId } } };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+      devicePermissionRequestedRef.current = true;
+
+      stopLocalStream();
+      localStreamRef.current = stream;
+      await startVolumeMonitor(stream);
       setSelectedDeviceId(deviceId);
+      selectedDeviceIdRef.current = deviceId;
+
+      let agoraDeviceUpdated = true;
+      if (agoraJoined) {
+        agoraDeviceUpdated = await updateAgoraAudioDevice(deviceId);
+      }
+
+      if (!agoraDeviceUpdated) {
+        const message =
+          'Microphone switched locally, but the voice call could not use the selected device.';
+        if (!silent) {
+          setDeviceStatusMessage(`${message} Try switching again or rejoining the call.`);
+        } else {
+          setDeviceStatusMessage(message);
+        }
+        return false;
+      }
+
       if (!silent) {
         setDeviceStatusMessage('Microphone updated.');
         setTimeout(() => setDeviceStatusMessage(''), 2000);
@@ -380,6 +568,8 @@ const CallPage = () => {
       console.error('Microphone switch failed', error);
       if (!silent) {
         setDeviceStatusMessage('Unable to switch microphone. Check permissions and try again.');
+      } else {
+        setDeviceStatusMessage('Unable to access microphone. Check permissions and try again.');
       }
       return false;
     }
@@ -528,28 +718,13 @@ const CallPage = () => {
     window.URL.revokeObjectURL(url);
   };
 
-  const handleEndCall = () => {
+  const handleEndCall = async () => {
     setCallActive(false);
     stopListening();
     window.speechSynthesis.cancel();
     stopVolumeMonitor();
-    if (localAudioTrackRef.current) {
-      try {
-        localAudioTrackRef.current.stop();
-        localAudioTrackRef.current.close();
-      } catch (error) {
-        console.error('Failed to close local Agora track on end call', error);
-      }
-      localAudioTrackRef.current = null;
-    }
-    if (agoraClientRef.current) {
-      const client = agoraClientRef.current;
-      client.removeAllListeners();
-      client.leave().catch((error) => {
-        console.error('Failed to leave Agora channel on end call', error);
-      });
-      agoraClientRef.current = null;
-    }
+    stopLocalStream();
+    await leaveAgoraVoiceCall();
     if (audioContextRef.current) {
       audioContextRef.current.close?.();
       audioContextRef.current = null;
@@ -601,7 +776,6 @@ const CallPage = () => {
         deviceStatusMessage={deviceStatusMessage}
         inputVolume={inputVolume}
       />
-      <div ref={remoteAudioContainerRef} className="sr-only" aria-hidden="true" />
     </div>
   );
 };
