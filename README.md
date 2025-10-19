@@ -33,26 +33,21 @@ npm run build
 npm run preview
 ```
 
-## Agora Setup
+## Agora Voice Setup
 
-The call experience now joins an Agora RTC channel for live audio. Provide your credentials though
-Vite environment variables (for local development create a `.env.local`):
+- The call page now connects to Agora for audio-only meetings when you click “Join Call”.
+- Add your Agora credentials to `.env.local` (values must be prefixed with `VITE_` for Vite):
+  - `VITE_AGORA_APP_ID`
+  - `VITE_AGORA_CHANNEL`
+  - `VITE_AGORA_TEMP_TOKEN` (leave blank when using an app certificate-less project)
+  - `VITE_AGORA_UID` (optional numeric UID; Agora will auto-assign if omitted)
+- Restart the dev server after updating `.env.local` so Vite picks up the new variables.
 
-```
-VITE_AGORA_APP_ID=your-app-id
-VITE_AGORA_CHANNEL=checklist-session   # optional, defaults to "checklist-session"
-VITE_AGORA_TOKEN=your-temporary-token  # optional when the project enables app certificate-less access
-VITE_AGORA_UID=12345                   # optional, Agora assigns one automatically when omitted
-```
+## Extending Voice Capabilities
 
-Restart the dev server after changing these values. The UI surfaces connection issues through the
-device status banner and continues to use the existing Web Speech pipeline.
-
-## Integrating Agora or Other AI Backends
-
-- `src/pages/CallPage.jsx` contains an `evaluateResponse` helper that currently mocks AI scoring. Replace this function with an async call to your Agora Conversational AI endpoint, returning the checklist status, recommendation, and AI response text.
-- Use the existing `addConversationMessage` helper to append transcript entries, and `setChecklist` to apply status updates.
-- `handleUserSpeech` is the main pipeline for recognized text—augment it with network calls and state management as needed.
+- `src/pages/CallPage.jsx` mocks AI scoring inside the `evaluateResponse` helper. Replace this function with a call to your backend when you are ready to integrate real intelligence.
+- Voice capture currently relies solely on the browser microphone via `navigator.mediaDevices.getUserMedia`. Swap in a streaming provider by wiring your connection logic into the initialization block and `applySelectedInput` helper.
+- The conversation flow is orchestrated by `handleUserSpeech`. Extend that function to relay transcripts to your service and handle its responses.
 
 ## Voice API Notes
 
