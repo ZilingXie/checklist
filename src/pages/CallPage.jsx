@@ -844,7 +844,7 @@ const CallPage = () => {
       <CallStatusBar statusLabel={statusLabel} tone={callTone} />
       <div className="flex flex-1 flex-col gap-6 lg:flex-row">
         <div className="flex flex-1 flex-col gap-6">
-          <ConversationVisualizer tone={callTone} />
+          <ConversationVisualizer tone={callTone} isConnected={agoraJoined} />
           <TranscriptPanel conversation={conversation} />
         </div>
         <div className="lg:w-[28rem]">

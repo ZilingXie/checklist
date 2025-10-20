@@ -1,11 +1,12 @@
-const ConversationVisualizer = ({ tone }) => {
-  const toneColor =
-    tone === 'speaking'
+const ConversationVisualizer = ({ tone, isConnected = false }) => {
+  const toneColor = isConnected
+    ? 'from-emerald-400 to-emerald-600'
+    : tone === 'speaking'
       ? 'from-brand-500 to-brand-700'
       : tone === 'listening'
         ? 'from-cyan-400 to-cyan-600'
         : tone === 'connecting'
-          ? 'from-amber-400 to-amber-600'
+          ? 'from-slate-700 to-slate-800'
           : 'from-slate-700 to-slate-800';
 
   return (
