@@ -41,6 +41,8 @@ const AGORA_AGENT_TTS_REGION = import.meta.env.VITE_AGORA_AGENT_TTS_REGION ?? 'e
 const AGORA_AGENT_TTS_VOICE =
   import.meta.env.VITE_AGORA_AGENT_TTS_VOICE ?? 'en-US-AndrewMultilingualNeural';
 
+const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
+
 const parseRemoteRtcUids = (value) => {
   if (!value) return ['*'];
   const parsed = value
@@ -55,6 +57,54 @@ const resolveIdleTimeout = () =>
 
 const resolveMaxHistory = () =>
   Number.isFinite(AGORA_AGENT_LLM_MAX_HISTORY) ? AGORA_AGENT_LLM_MAX_HISTORY : 10;
+
+const extractAgentSessionDetails = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const agentPayload =
+    typeof payload.agent === 'object' && payload.agent !== null ? payload.agent : undefined;
+  const directAgentId =
+    payload.agent_id ?? payload.agentId ?? payload.id ?? agentPayload?.agent_id ?? agentPayload?.id;
+  if (!directAgentId) {
+    return null;
+  }
+
+  const agentId = String(directAgentId);
+  const resolvedProjectId =
+    payload.project_id ??
+    payload.projectId ??
+    agentPayload?.project_id ??
+    agentPayload?.projectId ??
+    AGORA_APP_ID ??
+    undefined;
+
+  return {
+    agentId,
+    projectId: resolvedProjectId ? String(resolvedProjectId) : undefined,
+    recordedAt: Date.now()
+  };
+};
+
+const persistAgentSessionDetails = (details) => {
+  if (typeof window === 'undefined' || typeof window.sessionStorage === 'undefined') {
+    return;
+  }
+
+  const storage = window.sessionStorage;
+
+  if (!details) {
+    storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
+    return;
+  }
+
+  try {
+    storage.setItem(AGORA_AGENT_LAST_JOIN_KEY, JSON.stringify(details));
+  } catch (error) {
+    console.warn('Unable to persist Agora agent session details', error);
+  }
+};
 
 const buildAgentJoinPayload = () => {
   const properties = {
@@ -154,6 +204,7 @@ const LandingPage = () => {
     }
 
     const payload = buildAgentJoinPayload();
+    persistAgentSessionDetails(null);
 
     try {
       const response = await fetch(AGORA_AGENT_JOIN_URL, {
@@ -173,6 +224,41 @@ const LandingPage = () => {
           statusText: response.statusText,
           body: errorText
         });
+        return;
+      }
+
+      let parsedBody;
+      try {
+        const responseClone = response.clone();
+        const contentType = responseClone.headers.get('Content-Type') ?? '';
+        if (contentType.includes('application/json')) {
+          parsedBody = await responseClone.json();
+        } else {
+          const rawText = await responseClone.text();
+          if (rawText) {
+            try {
+              parsedBody = JSON.parse(rawText);
+            } catch {
+              console.warn('Agora agent join response returned non-JSON content.');
+            }
+          }
+        }
+      } catch (parseError) {
+        console.warn('Unable to parse Agora agent join response', parseError);
+      }
+
+      const sessionDetails = extractAgentSessionDetails(parsedBody);
+      if (sessionDetails) {
+        const { agentId, projectId } = sessionDetails;
+        if (projectId) {
+          sessionDetails.leaveUrl = `https://api.agora.io/api/conversational-ai-agent/v2/projects/${projectId}/agents/${agentId}/leave`;
+        } else if (AGORA_APP_ID) {
+          sessionDetails.projectId = AGORA_APP_ID;
+          sessionDetails.leaveUrl = `https://api.agora.io/api/conversational-ai-agent/v2/projects/${AGORA_APP_ID}/agents/${agentId}/leave`;
+        }
+        persistAgentSessionDetails(sessionDetails);
+      } else {
+        console.warn('Agora agent join response missing agent identifier. Leave request will be skipped.');
       }
     } catch (error) {
       console.error('Failed to invoke Agora agent join request', error);

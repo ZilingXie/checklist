@@ -72,6 +72,8 @@ const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
 const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN || null;
 const parsedAgoraUid = Number.parseInt(import.meta.env.VITE_AGORA_UID ?? '', 10);
 const AGORA_UID = Number.isFinite(parsedAgoraUid) ? parsedAgoraUid : null;
+const AGORA_AGENT_AUTH = import.meta.env.VITE_AGORA_AGENT_AUTH;
+const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
 
 const CallPage = () => {
   const navigate = useNavigate();
@@ -89,8 +91,8 @@ const CallPage = () => {
   const remoteAudioTracksRef = useRef(new Map());
   const agoraSessionContextRef = useRef(null);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
-  const [callTone, setCallTone] = useState('connected');
-  const [statusLabel, setStatusLabel] = useState('AI Assistant - Connected');
+  const [callTone, setCallTone] = useState('connecting');
+  const [statusLabel, setStatusLabel] = useState('Connecting…');
   const [conversation, setConversation] = useState([]);
   const [checklist, setChecklist] = useState(initialChecklist);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -144,7 +146,7 @@ const CallPage = () => {
     recognition.onend = () => {
       if (callActive && !isProcessing) {
         setCallTone('listening');
-        setStatusLabel('Listening for your response…');
+        setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
       }
     };
 
@@ -356,6 +358,8 @@ const CallPage = () => {
       agoraClientRef.current = null;
       if (isComponentMountedRef.current) {
         setAgoraJoined(false);
+        setStatusLabel('Disconnected');
+        setCallTone('idle');
       }
     }
     if (sessionContext && agoraSessionContextRef.current === sessionContext) {
@@ -367,6 +371,10 @@ const CallPage = () => {
     if (!callActive) return;
     if (!AGORA_APP_ID || !AGORA_CHANNEL) {
       console.warn('Missing Agora credentials. Voice call join skipped.');
+      if (isComponentMountedRef.current) {
+        setStatusLabel('Connected');
+        setCallTone('connected');
+      }
       return;
     }
 
@@ -377,6 +385,10 @@ const CallPage = () => {
     } catch (error) {
       console.error('Microphone permission is required for Agora voice call', error);
       setDeviceStatusMessage('Allow microphone access to join the voice call.');
+      if (isComponentMountedRef.current) {
+        setStatusLabel('Connection failed');
+        setCallTone('idle');
+      }
       return;
     }
 
@@ -395,6 +407,9 @@ const CallPage = () => {
     }
 
     try {
+      setCallTone('connecting');
+      setStatusLabel('Connecting…');
+
       await client.join(AGORA_APP_ID, AGORA_CHANNEL, AGORA_TOKEN || null, AGORA_UID ?? null);
       const trackConfig =
         selectedDeviceIdRef.current && selectedDeviceIdRef.current !== 'default'
@@ -406,11 +421,19 @@ const CallPage = () => {
         sessionContext.localTrack = localAudioTrack;
       }
       await client.publish([localAudioTrack]);
-      setAgoraJoined(true);
-      setDeviceStatusMessage('');
+      if (isComponentMountedRef.current) {
+        setAgoraJoined(true);
+        setDeviceStatusMessage('');
+        setStatusLabel('Connected');
+        setCallTone('connected');
+      }
     } catch (error) {
       console.error('Failed to join Agora voice call', error);
-      setDeviceStatusMessage('Unable to join the voice call. Check Agora configuration or permissions.');
+      if (isComponentMountedRef.current) {
+        setDeviceStatusMessage('Unable to join the voice call. Check Agora configuration or permissions.');
+        setStatusLabel('Connection failed');
+        setCallTone('idle');
+      }
     }
   };
 
@@ -614,12 +637,12 @@ const CallPage = () => {
     utterance.pitch = 1;
 
     setCallTone('speaking');
-    setStatusLabel('AI Speaking…');
+    setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
 
     utterance.onend = () => {
       if (!callActive) return;
       setCallTone('listening');
-      setStatusLabel('Listening for your response…');
+      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
       onComplete?.();
     };
 
@@ -634,7 +657,7 @@ const CallPage = () => {
     try {
       recognition.start();
       setCallTone('listening');
-      setStatusLabel('Listening for your response…');
+      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
     } catch {
       // recognition already started, ignore
     }
@@ -653,7 +676,7 @@ const CallPage = () => {
 
     setIsProcessing(true);
     setCallTone('connected');
-    setStatusLabel('Processing your response…');
+    setStatusLabel('Processing…');
 
     const currentItem = checklist[currentIndex];
     const nextItem = checklist[currentIndex + 1];
@@ -698,7 +721,7 @@ const CallPage = () => {
         addConversationMessage('ai', summaryMessage);
         speakText(summaryMessage, () => {
           setCallTone('connected');
-          setStatusLabel('Review complete.');
+          setStatusLabel('Review complete');
         });
       });
     }
@@ -718,6 +741,69 @@ const CallPage = () => {
     window.URL.revokeObjectURL(url);
   };
 
+  const stopAgoraAgent = async () => {
+    if (typeof window === 'undefined' || typeof window.sessionStorage === 'undefined') {
+      return;
+    }
+
+    const storage = window.sessionStorage;
+    const serialized = storage.getItem(AGORA_AGENT_LAST_JOIN_KEY);
+    if (!serialized) {
+      return;
+    }
+
+    let storedDetails;
+    try {
+      storedDetails = JSON.parse(serialized);
+    } catch (error) {
+      console.warn('Unable to parse stored Agora agent session details', error);
+      storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
+      return;
+    }
+
+    const agentId = storedDetails?.agentId ?? storedDetails?.agent_id ?? storedDetails?.id;
+    const projectId = storedDetails?.projectId ?? AGORA_APP_ID;
+    const leaveUrl =
+      storedDetails?.leaveUrl ??
+      (agentId && projectId
+        ? `https://api.agora.io/api/conversational-ai-agent/v2/projects/${projectId}/agents/${agentId}/leave`
+        : undefined);
+
+    if (!AGORA_AGENT_AUTH || typeof fetch !== 'function') {
+      storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
+      return;
+    }
+
+    if (!agentId || !leaveUrl) {
+      console.warn('Unable to resolve Agora agent leave URL; skipping request.');
+      storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
+      return;
+    }
+
+    try {
+      const response = await fetch(leaveUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${AGORA_AGENT_AUTH}`
+        },
+        keepalive: true
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        console.error('Agora agent leave request failed', {
+          status: response.status,
+          statusText: response.statusText,
+          body: errorText
+        });
+      }
+    } catch (error) {
+      console.error('Failed to invoke Agora agent leave request', error);
+    } finally {
+      storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
+    }
+  };
+
   const handleEndCall = async () => {
     setCallActive(false);
     stopListening();
@@ -730,6 +816,7 @@ const CallPage = () => {
       audioContextRef.current = null;
     }
     setIsDeviceMenuOpen(false);
+    void stopAgoraAgent();
     navigate('/');
   };
 

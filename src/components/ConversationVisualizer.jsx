@@ -1,6 +1,12 @@
 const ConversationVisualizer = ({ tone }) => {
   const toneColor =
-    tone === 'speaking' ? 'from-brand-500 to-brand-700' : tone === 'listening' ? 'from-cyan-400 to-cyan-600' : 'from-slate-700 to-slate-800';
+    tone === 'speaking'
+      ? 'from-brand-500 to-brand-700'
+      : tone === 'listening'
+        ? 'from-cyan-400 to-cyan-600'
+        : tone === 'connecting'
+          ? 'from-amber-400 to-amber-600'
+          : 'from-slate-700 to-slate-800';
 
   return (
     <div className="relative flex h-64 items-center justify-center rounded-3xl border border-white/10 bg-gradient-to-br from-slate-900 via-slate-925 to-slate-900 p-8">
