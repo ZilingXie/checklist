@@ -21,6 +21,10 @@ const AGENT_CONTROLLER_URL =
 const AGENT_JOIN_ENDPOINT = AGENT_CONTROLLER_URL
   ? `${AGENT_CONTROLLER_URL.replace(/\/$/, '')}/agent/join`
   : '';
+const AGENT_CONTROLLER_AUTH_TOKEN =
+  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_TOKEN ??
+  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_SECRET ??
+  '';
 
 const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
 
@@ -160,11 +164,17 @@ const LandingPage = () => {
     persistAgentSessionDetails(null);
 
     try {
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+
+      if (AGENT_CONTROLLER_AUTH_TOKEN) {
+        headers.Authorization = `Bearer ${AGENT_CONTROLLER_AUTH_TOKEN}`;
+      }
+
       const response = await fetch(AGENT_JOIN_ENDPOINT, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers,
         body: JSON.stringify(payload),
         keepalive: true
       });

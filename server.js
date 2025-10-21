@@ -121,7 +121,7 @@ const resolveCorsOrigin = (requestOrigin) => {
 const commonCorsHeaders = (origin) => {
   const headers = {
     'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type'
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Agent-Auth'
   };
   if (origin) {
     headers['Access-Control-Allow-Origin'] = origin;
@@ -138,6 +138,71 @@ const respondJson = (res, statusCode, payload, origin, extraHeaders = {}) => {
 
   res.writeHead(statusCode, headers);
   res.end(JSON.stringify(payload));
+};
+
+const resolveRequestAuthToken = () =>
+  resolveEnv('AGENT_CONTROLLER_AUTH_TOKEN', 'VITE_AGENT_CONTROLLER_AUTH_TOKEN');
+
+const extractAuthToken = (req) => {
+  const authorization = req.headers.authorization;
+  if (typeof authorization === 'string' && authorization.trim() !== '') {
+    const [scheme, value] = authorization.split(/\s+/);
+    if (value) {
+      if (scheme && scheme.toLowerCase() === 'bearer') {
+        return value.trim();
+      }
+      return value.trim();
+    }
+    return authorization.trim();
+  }
+
+  const headerToken =
+    req.headers['x-agent-auth'] ??
+    req.headers['x-api-key'] ??
+    req.headers['x-access-token'];
+  if (typeof headerToken === 'string' && headerToken.trim() !== '') {
+    return headerToken.trim();
+  }
+
+  return undefined;
+};
+
+const ensureRequestAuthorized = (req, res, origin) => {
+  const expectedToken = resolveRequestAuthToken();
+  if (!expectedToken) {
+    respondJson(
+      res,
+      500,
+      { error: 'Agent controller authentication token is not configured on the server.' },
+      origin
+    );
+    return false;
+  }
+
+  const providedToken = extractAuthToken(req);
+  if (!providedToken) {
+    respondJson(
+      res,
+      401,
+      { error: 'Missing authorization token.' },
+      origin,
+      { 'WWW-Authenticate': 'Bearer' }
+    );
+    return false;
+  }
+
+  if (providedToken !== expectedToken) {
+    respondJson(
+      res,
+      401,
+      { error: 'Invalid authorization token.' },
+      origin,
+      { 'WWW-Authenticate': 'Bearer error=\"invalid_token\"' }
+    );
+    return false;
+  }
+
+  return true;
 };
 
 const readRequestBody = (req) =>
@@ -516,6 +581,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && pathname === '/agent/join') {
+    if (!ensureRequestAuthorized(req, res, origin)) {
+      return;
+    }
+
     let body;
     try {
       body = await readRequestBody(req);
@@ -620,6 +689,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && pathname === '/agent/leave') {
+    if (!ensureRequestAuthorized(req, res, origin)) {
+      return;
+    }
+
     let body;
     try {
       body = await readRequestBody(req);
