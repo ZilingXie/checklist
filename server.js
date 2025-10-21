@@ -560,6 +560,19 @@ const forwardLeaveRequest = async (target) => {
 };
 
 const server = http.createServer(async (req, res) => {
+  const startedAt = Date.now();
+  const method = req.method ?? 'UNKNOWN';
+  const rawUrl = req.url ?? '/';
+  const remoteAddress = req.socket?.remoteAddress ?? 'unknown';
+  console.log(`[server.js] ${method} ${rawUrl} <- ${remoteAddress}`);
+
+  res.on('finish', () => {
+    const durationMs = Date.now() - startedAt;
+    console.log(
+      `[server.js] ${method} ${rawUrl} -> ${res.statusCode} (${durationMs}ms)`
+    );
+  });
+
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const pathname = url.pathname.replace(/\/+$/, '') || '/';
   const origin = resolveCorsOrigin(req.headers.origin);
