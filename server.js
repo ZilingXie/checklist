@@ -442,8 +442,61 @@ const forwardJoinRequest = async (payload) => {
   };
 };
 
+const buildLeaveTarget = (input = {}) => {
+  const leaveUrl = input.leaveUrl ?? input.url;
+  const agentId = input.agentId ?? input.agent_id ?? input.id;
+  const projectId =
+    input.projectId ?? input.project_id ?? resolveEnv('AGORA_APP_ID', 'VITE_AGORA_APP_ID');
+
+  if (leaveUrl) {
+    return { agentId: agentId ? String(agentId) : undefined, url: leaveUrl };
+  }
+
+  if (!agentId) {
+    throw new Error('MISSING_AGENT_ID');
+  }
+
+  if (!projectId) {
+    throw new Error('MISSING_PROJECT_ID');
+  }
+
+  return {
+    agentId: String(agentId),
+    projectId: String(projectId),
+    url: `https://api.agora.io/api/conversational-ai-agent/v2/projects/${projectId}/agents/${agentId}/leave`
+  };
+};
+
+const forwardLeaveRequest = async (target) => {
+  const authToken = resolveEnv(
+    'AGORA_AGENT_AUTH',
+    'VITE_AGORA_AGENT_AUTH'
+  );
+  if (!authToken) {
+    throw new Error('MISSING_AGENT_AUTH');
+  }
+
+  const { url } = buildLeaveTarget(target);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${authToken}`
+    },
+    keepalive: true
+  });
+
+  const rawBody = await response.text();
+  return {
+    status: response.status,
+    ok: response.ok,
+    body: rawBody || '{}'
+  };
+};
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+  const pathname = url.pathname.replace(/\/+$/, '') || '/';
   const origin = resolveCorsOrigin(req.headers.origin);
 
   const corsHeaders = commonCorsHeaders(origin);
@@ -457,12 +510,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && url.pathname === '/health') {
+  if (req.method === 'GET' && pathname === '/health') {
     respondJson(res, 200, { status: 'ok' }, origin);
     return;
   }
 
-  if (req.method === 'POST' && url.pathname === '/agent/join') {
+  if (req.method === 'POST' && pathname === '/agent/join') {
     let body;
     try {
       body = await readRequestBody(req);
@@ -563,6 +616,72 @@ const server = http.createServer(async (req, res) => {
       'Content-Type': 'application/json; charset=utf-8'
     });
     res.end(agoraResponse.body);
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/agent/leave') {
+    let body;
+    try {
+      body = await readRequestBody(req);
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.message === 'PAYLOAD_TOO_LARGE') {
+          respondJson(res, 413, { error: 'Request payload too large' }, origin);
+          return;
+        }
+        if (error.message === 'INVALID_JSON') {
+          respondJson(res, 400, { error: 'Invalid JSON payload' }, origin);
+          return;
+        }
+      }
+    }
+
+    if (!body || typeof body !== 'object') {
+      respondJson(res, 400, { error: 'Leave request body is required.' }, origin);
+      return;
+    }
+
+    try {
+      const agoraResponse = await forwardLeaveRequest(body);
+      res.writeHead(agoraResponse.status, {
+        ...commonCorsHeaders(origin),
+        'Content-Type': 'application/json; charset=utf-8'
+      });
+      res.end(agoraResponse.body);
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.message === 'MISSING_AGENT_AUTH') {
+          respondJson(
+            res,
+            500,
+            { error: 'Agora agent authentication is not configured.' },
+            origin
+          );
+          return;
+        }
+        if (error.message === 'MISSING_AGENT_ID') {
+          respondJson(res, 400, { error: 'Agent identifier is required to leave.' }, origin);
+          return;
+        }
+        if (error.message === 'MISSING_PROJECT_ID') {
+          respondJson(
+            res,
+            500,
+            { error: 'Agora project identifier is not configured.' },
+            origin
+          );
+          return;
+        }
+      }
+
+      console.error('Failed to forward Agora agent leave request', error);
+      respondJson(
+        res,
+        502,
+        { error: 'Failed to reach Agora agent service.' },
+        origin
+      );
+    }
     return;
   }
 

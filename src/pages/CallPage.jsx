@@ -72,8 +72,12 @@ const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
 const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN || null;
 const parsedAgoraUid = Number.parseInt(import.meta.env.VITE_AGORA_UID ?? '', 10);
 const AGORA_UID = Number.isFinite(parsedAgoraUid) ? parsedAgoraUid : null;
-const AGORA_AGENT_AUTH = import.meta.env.VITE_AGORA_AGENT_AUTH;
 const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
+const AGENT_CONTROLLER_URL =
+  import.meta.env.VITE_AGENT_CONTROLLER_URL ?? import.meta.env.VITE_AI_AGENT_SERVER_URL ?? '';
+const AGENT_LEAVE_ENDPOINT = AGENT_CONTROLLER_URL
+  ? `${AGENT_CONTROLLER_URL.replace(/\/$/, '')}/agent/leave`
+  : '';
 
 const CallPage = () => {
   const navigate = useNavigate();
@@ -769,36 +773,41 @@ const CallPage = () => {
         ? `https://api.agora.io/api/conversational-ai-agent/v2/projects/${projectId}/agents/${agentId}/leave`
         : undefined);
 
-    if (!AGORA_AGENT_AUTH || typeof fetch !== 'function') {
+    if (!AGENT_LEAVE_ENDPOINT || typeof fetch !== 'function') {
       storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
       return;
     }
 
-    if (!agentId || !leaveUrl) {
-      console.warn('Unable to resolve Agora agent leave URL; skipping request.');
+    if (!agentId) {
+      console.warn('Unable to resolve Agora agent identifier; skipping leave request.');
       storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
       return;
     }
 
     try {
-      const response = await fetch(leaveUrl, {
+      const response = await fetch(AGENT_LEAVE_ENDPOINT, {
         method: 'POST',
         headers: {
-          Authorization: `Basic ${AGORA_AGENT_AUTH}`
+          'Content-Type': 'application/json'
         },
+        body: JSON.stringify({
+          agentId,
+          projectId: storedDetails?.projectId ?? AGORA_APP_ID,
+          leaveUrl
+        }),
         keepalive: true
       });
 
       if (!response.ok) {
         const errorText = await response.text().catch(() => '');
-        console.error('Agora agent leave request failed', {
+        console.error('Agent controller leave request failed', {
           status: response.status,
           statusText: response.statusText,
           body: errorText
         });
       }
     } catch (error) {
-      console.error('Failed to invoke Agora agent leave request', error);
+      console.error('Failed to invoke agent controller leave request', error);
     } finally {
       storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
     }
