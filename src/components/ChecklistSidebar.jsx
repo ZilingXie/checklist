@@ -14,7 +14,7 @@ const prettyStatus = {
 
 const ChecklistSidebar = ({ items }) => {
   return (
-    <aside className="flex h-full flex-col gap-4 rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur-lg">
+    <aside className="flex h-full w-full flex-col gap-4 rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur-lg">
       <header>
         <h3 className="text-lg font-semibold text-white">Checklist</h3>
         <p className="text-xs text-white/60">Statuses update as the AI evaluates each response.</p>

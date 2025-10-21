@@ -842,13 +842,13 @@ const CallPage = () => {
   return (
     <div className="flex min-h-screen flex-col gap-6 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 p-6 text-white">
       <CallStatusBar statusLabel={statusLabel} tone={callTone} />
-      <div className="flex flex-1 flex-col gap-6 lg:flex-row">
-        <div className="flex flex-1 flex-col gap-6">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] xl:grid-cols-[minmax(0,1fr)_24rem]">
+        <div className="flex min-h-0">
+          <ChecklistSidebar items={checklist} />
+        </div>
+        <div className="flex min-h-0 flex-col gap-6">
           <ConversationVisualizer tone={callTone} isConnected={agoraJoined} />
           <TranscriptPanel conversation={conversation} />
-        </div>
-        <div className="lg:w-[28rem]">
-          <ChecklistSidebar items={checklist} />
         </div>
       </div>
       <CallControls

@@ -4,12 +4,6 @@ import { Link } from 'react-router-dom';
 const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
 const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
 const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN ?? '';
-const AGORA_AGENT_AUTH = import.meta.env.VITE_AGORA_AGENT_AUTH;
-const AGORA_AGENT_JOIN_URL =
-  import.meta.env.VITE_AGORA_AGENT_JOIN_URL ||
-  (AGORA_APP_ID
-    ? `https://api.agora.io/api/conversational-ai-agent/v2/projects/${AGORA_APP_ID}/join`
-    : undefined);
 const AGORA_AGENT_NAME = import.meta.env.VITE_AGORA_AGENT_NAME ?? 'checklist-agent';
 const AGORA_AGENT_RTC_UID = import.meta.env.VITE_AGORA_AGENT_RTC_UID ?? '0';
 const AGORA_AGENT_REMOTE_UIDS = import.meta.env.VITE_AGORA_AGENT_REMOTE_UIDS ?? '*';
@@ -20,26 +14,13 @@ const AGORA_AGENT_IDLE_TIMEOUT = Number.parseInt(
   10
 );
 const AGORA_AGENT_ASR_LANGUAGE = import.meta.env.VITE_AGORA_AGENT_ASR_LANGUAGE ?? 'en-US';
-const AGORA_AGENT_LLM_URL =
-  import.meta.env.VITE_AGORA_AGENT_LLM_URL ?? 'https://api.openai.com/v1/chat/completions';
-const AGORA_AGENT_LLM_API_KEY = import.meta.env.VITE_AGORA_AGENT_LLM_API_KEY;
-const AGORA_AGENT_LLM_MODEL = import.meta.env.VITE_AGORA_AGENT_LLM_MODEL ?? 'gpt-4o-mini';
-const AGORA_AGENT_SYSTEM_MESSAGE =
-  import.meta.env.VITE_AGORA_AGENT_SYSTEM_MESSAGE ?? 'You are a helpful chatbot.';
-const AGORA_AGENT_GREETING_MESSAGE =
-  import.meta.env.VITE_AGORA_AGENT_GREETING_MESSAGE ?? 'Hello, how can I help you?';
-const AGORA_AGENT_FAILURE_MESSAGE =
-  import.meta.env.VITE_AGORA_AGENT_FAILURE_MESSAGE ??
-  "Sorry, I don't know how to answer this question.";
-const AGORA_AGENT_LLM_MAX_HISTORY = Number.parseInt(
-  import.meta.env.VITE_AGORA_AGENT_LLM_MAX_HISTORY ?? '',
-  10
-);
-const AGORA_AGENT_TTS_VENDOR = import.meta.env.VITE_AGORA_AGENT_TTS_VENDOR ?? 'microsoft';
-const AGORA_AGENT_TTS_KEY = import.meta.env.VITE_AGORA_AGENT_TTS_KEY;
-const AGORA_AGENT_TTS_REGION = import.meta.env.VITE_AGORA_AGENT_TTS_REGION ?? 'eastus';
-const AGORA_AGENT_TTS_VOICE =
-  import.meta.env.VITE_AGORA_AGENT_TTS_VOICE ?? 'en-US-AndrewMultilingualNeural';
+const AGENT_CONTROLLER_URL =
+  import.meta.env.VITE_AGENT_CONTROLLER_URL ??
+  import.meta.env.VITE_AI_AGENT_SERVER_URL ??
+  '';
+const AGENT_JOIN_ENDPOINT = AGENT_CONTROLLER_URL
+  ? `${AGENT_CONTROLLER_URL.replace(/\/$/, '')}/agent/join`
+  : '';
 
 const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
 
@@ -54,9 +35,6 @@ const parseRemoteRtcUids = (value) => {
 
 const resolveIdleTimeout = () =>
   Number.isFinite(AGORA_AGENT_IDLE_TIMEOUT) ? AGORA_AGENT_IDLE_TIMEOUT : 120;
-
-const resolveMaxHistory = () =>
-  Number.isFinite(AGORA_AGENT_LLM_MAX_HISTORY) ? AGORA_AGENT_LLM_MAX_HISTORY : 10;
 
 const extractAgentSessionDetails = (payload) => {
   if (!payload || typeof payload !== 'object') {
@@ -106,52 +84,22 @@ const persistAgentSessionDetails = (details) => {
   }
 };
 
-const buildAgentJoinPayload = () => {
-  const properties = {
-    channel: AGORA_CHANNEL,
-    token: AGORA_TOKEN ?? '',
-    agent_rtc_uid: AGORA_AGENT_RTC_UID,
-    remote_rtc_uids: parseRemoteRtcUids(AGORA_AGENT_REMOTE_UIDS),
-    enable_string_uid: AGORA_AGENT_ENABLE_STRING_UID,
-    idle_timeout: resolveIdleTimeout(),
-    asr: {
-      language: AGORA_AGENT_ASR_LANGUAGE
-    }
-  };
-
-  if (AGORA_AGENT_LLM_API_KEY) {
-    properties.llm = {
-      url: AGORA_AGENT_LLM_URL,
-      api_key: AGORA_AGENT_LLM_API_KEY,
-      system_messages: [
-        {
-          role: 'system',
-          content: AGORA_AGENT_SYSTEM_MESSAGE
-        }
-      ],
-      greeting_message: AGORA_AGENT_GREETING_MESSAGE,
-      failure_message: AGORA_AGENT_FAILURE_MESSAGE,
-      max_history: resolveMaxHistory(),
-      params: {
-        model: AGORA_AGENT_LLM_MODEL
-      }
-    };
-  }
-
-  if (AGORA_AGENT_TTS_KEY) {
-    properties.tts = {
-      vendor: AGORA_AGENT_TTS_VENDOR,
-      params: {
-        key: AGORA_AGENT_TTS_KEY,
-        region: AGORA_AGENT_TTS_REGION,
-        voice_name: AGORA_AGENT_TTS_VOICE
-      }
-    };
+const buildAgentJoinRequest = () => {
+  if (!AGORA_CHANNEL) {
+    return null;
   }
 
   return {
-    name: AGORA_AGENT_NAME,
-    properties
+    agentName: AGORA_AGENT_NAME,
+    channel: AGORA_CHANNEL,
+    token: AGORA_TOKEN ?? '',
+    agentRtcUid: AGORA_AGENT_RTC_UID,
+    remoteRtcUids: parseRemoteRtcUids(AGORA_AGENT_REMOTE_UIDS),
+    enableStringUid: AGORA_AGENT_ENABLE_STRING_UID,
+    idleTimeout: resolveIdleTimeout(),
+    asr: {
+      language: AGORA_AGENT_ASR_LANGUAGE
+    }
   };
 };
 
@@ -188,8 +136,8 @@ const LandingPage = () => {
   };
 
   const sendAgentJoinRequest = async () => {
-    if (!AGORA_AGENT_JOIN_URL || !AGORA_AGENT_AUTH) {
-      console.warn('Missing Agora agent join configuration. Skipping agent join request.');
+    if (!AGENT_JOIN_ENDPOINT) {
+      console.warn('Missing agent controller endpoint. Skipping agent join request.');
       return;
     }
 
@@ -203,15 +151,19 @@ const LandingPage = () => {
       return;
     }
 
-    const payload = buildAgentJoinPayload();
+    const payload = buildAgentJoinRequest();
+    if (!payload) {
+      console.warn('Unable to build agent join request payload. Skipping agent join request.');
+      return;
+    }
+
     persistAgentSessionDetails(null);
 
     try {
-      const response = await fetch(AGORA_AGENT_JOIN_URL, {
+      const response = await fetch(AGENT_JOIN_ENDPOINT, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Basic ${AGORA_AGENT_AUTH}`
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify(payload),
         keepalive: true
@@ -219,7 +171,7 @@ const LandingPage = () => {
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.error('Agora agent join request failed', {
+        console.error('Agent controller join request failed', {
           status: response.status,
           statusText: response.statusText,
           body: errorText
@@ -261,7 +213,7 @@ const LandingPage = () => {
         console.warn('Agora agent join response missing agent identifier. Leave request will be skipped.');
       }
     } catch (error) {
-      console.error('Failed to invoke Agora agent join request', error);
+      console.error('Failed to invoke agent controller join request', error);
     }
   };
 

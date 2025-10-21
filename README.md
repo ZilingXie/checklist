@@ -45,15 +45,13 @@ npm run preview
 
 ## Conversational AI Agent Join
 
-- Clicking “Join Call” now invokes the Agora Conversational AI Agent join API (`/api/conversational-ai-agent/v2/projects/{projectId}/join`).
-- Provide the agent configuration via `.env.local`:
-  - `VITE_AGORA_AGENT_AUTH`: Base64 string of `CustomerID:CustomerSecret` for Basic auth.
-  - `VITE_AGORA_AGENT_JOIN_URL`: Optional override for the join endpoint. Defaults to the project URL built from `VITE_AGORA_APP_ID`.
-  - `VITE_AGORA_AGENT_NAME`, `VITE_AGORA_AGENT_RTC_UID`, `VITE_AGORA_AGENT_REMOTE_UIDS`, `VITE_AGORA_AGENT_ENABLE_STRING_UID`, `VITE_AGORA_AGENT_IDLE_TIMEOUT`.
-  - `VITE_AGORA_AGENT_ASR_LANGUAGE` (defaults to `en-US`).
-  - Optional LLM params: `VITE_AGORA_AGENT_LLM_URL`, `VITE_AGORA_AGENT_LLM_API_KEY`, `VITE_AGORA_AGENT_LLM_MODEL`, `VITE_AGORA_AGENT_SYSTEM_MESSAGE`, `VITE_AGORA_AGENT_GREETING_MESSAGE`, `VITE_AGORA_AGENT_FAILURE_MESSAGE`, `VITE_AGORA_AGENT_LLM_MAX_HISTORY`.
-  - Optional TTS params: `VITE_AGORA_AGENT_TTS_VENDOR`, `VITE_AGORA_AGENT_TTS_KEY`, `VITE_AGORA_AGENT_TTS_REGION`, `VITE_AGORA_AGENT_TTS_VOICE`.
-- These credentials are exposed client-side; deploy only in trusted environments or proxy the request through your backend for production scenarios.
+- Clicking “Join Call” now sends a POST request to the agent controller service (`server.js`), which forwards the payload to Agora’s Conversational AI Agent join API.
+- Point `VITE_AGENT_CONTROLLER_URL` (or `VITE_AI_AGENT_SERVER_URL`) in `.env.local` to the base URL of your deployed controller; the client will call `${baseUrl}/agent/join`.
+- Run the controller locally with `node server.js` (default host `0.0.0.0:3000`) and deploy it to AWS EC2 for production. Configure optional `PORT`, `HOST`, or `ALLOWED_ORIGINS` environment variables to fit your hosting environment.
+- The controller will automatically read a `.env` file from its working directory—store your `AGORA_*` secrets there when running on EC2 instead of exporting them manually.
+- Start from `.env.example` for local testing: copy it to `.env`, fill in the Agora values, and the same settings will be picked up when you run `node server.js`.
+- Provide the controller with Agora credentials and settings via environment variables: `AGORA_APP_ID`, `AGORA_AGENT_AUTH` (Base64 `CustomerID:CustomerSecret`), `AGORA_CHANNEL`, `AGORA_TEMP_TOKEN`, `AGORA_AGENT_NAME`, `AGORA_AGENT_RTC_UID`, `AGORA_AGENT_REMOTE_UIDS`, `AGORA_AGENT_ENABLE_STRING_UID`, `AGORA_AGENT_IDLE_TIMEOUT`, `AGORA_AGENT_ASR_LANGUAGE`, plus optional LLM (`AGORA_AGENT_LLM_API_KEY`, `AGORA_AGENT_LLM_URL`, `AGORA_AGENT_LLM_MODEL`, `AGORA_AGENT_SYSTEM_MESSAGE`, `AGORA_AGENT_GREETING_MESSAGE`, `AGORA_AGENT_FAILURE_MESSAGE`, `AGORA_AGENT_LLM_MAX_HISTORY`) and TTS (`AGORA_AGENT_TTS_KEY`, `AGORA_AGENT_TTS_VENDOR`, `AGORA_AGENT_TTS_REGION`, `AGORA_AGENT_TTS_VOICE`) parameters.
+- With the proxy in place the browser no longer needs direct access to the Agora secrets—keep them server-side for production deployments.
 
 ## Extending Voice Capabilities
 
