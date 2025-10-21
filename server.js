@@ -371,14 +371,22 @@ const buildAgentJoinPayload = (overrides = {}) => {
     }
   };
 
-  const llmApiKey = resolveEnv(
-    'AGORA_AGENT_LLM_API_KEY',
-    'VITE_AGORA_AGENT_LLM_API_KEY'
+  const defaultCustomLlmUrl = 'http://localhost:3100/chat/completions';
+  const customLlmUrl = resolveEnv(
+    'CUSTOM_LLM_PUBLIC_URL',
+    'VITE_CUSTOM_LLM_PUBLIC_URL'
   );
-  if (llmApiKey) {
-    const llmUrl =
-      resolveEnv('AGORA_AGENT_LLM_URL', 'VITE_AGORA_AGENT_LLM_URL') ??
-      'https://api.openai.com/v1/chat/completions';
+  const configuredLlmUrl = resolveEnv(
+    'AGORA_AGENT_LLM_URL',
+    'VITE_AGORA_AGENT_LLM_URL'
+  );
+  const llmUrl = customLlmUrl ?? configuredLlmUrl ?? defaultCustomLlmUrl;
+  const isCustomLlm = Boolean(customLlmUrl) || llmUrl === defaultCustomLlmUrl;
+
+  if (llmUrl) {
+    const llmApiKey = isCustomLlm
+      ? resolveEnv('CUSTOM_LLM_CLIENT_API_KEY', 'VITE_CUSTOM_LLM_CLIENT_API_KEY')
+      : resolveEnv('AGORA_AGENT_LLM_API_KEY', 'VITE_AGORA_AGENT_LLM_API_KEY');
     const systemMessage =
       resolveEnv(
         'AGORA_AGENT_SYSTEM_MESSAGE',
@@ -402,12 +410,16 @@ const buildAgentJoinPayload = (overrides = {}) => {
       10
     );
     const llmModel =
-      resolveEnv('AGORA_AGENT_LLM_MODEL', 'VITE_AGORA_AGENT_LLM_MODEL') ??
+      resolveEnv(
+        'CUSTOM_LLM_MODEL',
+        'VITE_CUSTOM_LLM_MODEL',
+        'AGORA_AGENT_LLM_MODEL',
+        'VITE_AGORA_AGENT_LLM_MODEL'
+      ) ??
       'gpt-4o-mini';
 
-    properties.llm = {
+    const llmConfig = {
       url: llmUrl,
-      api_key: llmApiKey,
       system_messages: [
         {
           role: 'system',
@@ -418,9 +430,16 @@ const buildAgentJoinPayload = (overrides = {}) => {
       failure_message: failureMessage,
       max_history: llmMaxHistory,
       params: {
-        model: llmModel
+        model: llmModel,
+        stream: true
       }
     };
+
+    if (llmApiKey) {
+      llmConfig.api_key = llmApiKey;
+    }
+
+    properties.llm = llmConfig;
   }
 
   const ttsKey = resolveEnv(

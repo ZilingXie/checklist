@@ -184,14 +184,50 @@ const baseUrl =
   env.CUSTOM_LLM_BASE_URL ??
   env.AGORA_AGENT_LLM_URL ??
   'https://api.openai.com/v1/chat/completions';
-const apiKey =
-  env.CUSTOM_LLM_API_KEY ??
-  env.AGORA_AGENT_LLM_API_KEY ??
-  env.VITE_AGORA_AGENT_LLM_API_KEY ??
-  env.YOUR_LLM_API_KEY ??
-  env.OPENAI_API_KEY;
+
+const looksLikePlaceholderValue = (value) => {
+  if (!value) return true;
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) return true;
+  return (
+    normalized.includes('your-secret-key') ||
+    normalized.includes('your-openai-api-key') ||
+    normalized.includes('your_api_key') ||
+    normalized.includes('replace-with') ||
+    normalized.includes('example-key')
+  );
+};
+
+const resolveApiKey = () => {
+  const candidates = [
+    ['CUSTOM_LLM_API_KEY', env.CUSTOM_LLM_API_KEY],
+    ['AGORA_AGENT_LLM_API_KEY', env.AGORA_AGENT_LLM_API_KEY],
+    ['VITE_AGORA_AGENT_LLM_API_KEY', env.VITE_AGORA_AGENT_LLM_API_KEY],
+    ['YOUR_LLM_API_KEY', env.YOUR_LLM_API_KEY],
+    ['OPENAI_API_KEY', env.OPENAI_API_KEY]
+  ];
+
+  for (const [sourceName, value] of candidates) {
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    if (looksLikePlaceholderValue(trimmed)) {
+      console.warn(`[customllm.js] Ignoring placeholder value provided for ${sourceName}.`);
+      continue;
+    }
+    return trimmed;
+  }
+
+  return undefined;
+};
+
+const apiKey = resolveApiKey();
 
 const requestTimeoutMs = parseInteger(env.CUSTOM_LLM_REQUEST_TIMEOUT_MS, 30_000);
+
+console.log(
+  `[customllm.js] Upstream base URL: ${baseUrl} (default model: ${defaultModel})`
+);
 
 const callChatApi = async (payload) => {
   if (!apiKey) {
@@ -365,7 +401,8 @@ const buildChatPayload = ({
   audio,
   parallel_tool_calls,
   stream_options,
-  context
+  context,
+  stream
 }) => {
   const payload = {
     model,
@@ -397,7 +434,11 @@ const buildChatPayload = ({
     payload.parallel_tool_calls = parallel_tool_calls;
   }
 
-  if (stream_options && Object.keys(stream_options).length > 0) {
+  if (stream === true) {
+    payload.stream = true;
+  }
+
+  if (stream === true && stream_options && Object.keys(stream_options).length > 0) {
     payload.stream_options = stream_options;
   }
 
@@ -476,7 +517,8 @@ const handleChatCompletion = async (req, res, origin) => {
         audio: body.audio,
         parallel_tool_calls: body.parallel_tool_calls,
         stream_options: body.stream_options,
-        context: body.context
+        context: body.context,
+        stream: false
       });
 
       const upstreamResponse = await callChatApi(payload);
