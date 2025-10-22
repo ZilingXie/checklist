@@ -145,6 +145,7 @@ const CallPage = () => {
   const agoraLocalAudioTrackRef = useRef(null);
   const remoteAudioTracksRef = useRef(new Map());
   const agoraSessionContextRef = useRef(null);
+  const hasResetChecklistRef = useRef(false);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('connecting');
   const [statusLabel, setStatusLabel] = useState('Connecting…');
@@ -274,6 +275,46 @@ const CallPage = () => {
       }
     };
   }, [checklistApiBase]);
+
+  const resetChecklistForNewCall = async () => {
+    if (!isComponentMountedRef.current) return;
+    if (hasResetChecklistRef.current) return;
+
+    hasResetChecklistRef.current = true;
+
+    setChecklist((previous) =>
+      previous.map((item) => ({
+        ...item,
+        status: 'pending',
+        recommendation: ''
+      }))
+    );
+    setCurrentIndex(0);
+
+    const baseUrl = checklistApiBaseRef.current;
+    if (!baseUrl) {
+      console.warn('Checklist API base URL is not available; skipping remote reset request.');
+      return;
+    }
+
+    try {
+      const response = await fetch(`${baseUrl}/checklist/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      if (!response.ok) {
+        console.error('Checklist reset request failed', {
+          status: response.status,
+          statusText: response.statusText
+        });
+        hasResetChecklistRef.current = false;
+      }
+    } catch (error) {
+      console.error('Checklist reset request failed', error);
+      hasResetChecklistRef.current = false;
+    }
+  };
 
   useEffect(() => {
     isComponentMountedRef.current = true;
@@ -528,6 +569,7 @@ const CallPage = () => {
     if (sessionContext && agoraSessionContextRef.current === sessionContext) {
       agoraSessionContextRef.current = null;
     }
+    hasResetChecklistRef.current = false;
   };
 
   const joinAgoraVoiceCall = async (sessionContext = agoraSessionContextRef.current) => {
@@ -538,6 +580,7 @@ const CallPage = () => {
         setStatusLabel('Connected');
         setCallTone('connected');
       }
+      void resetChecklistForNewCall();
       return;
     }
 
@@ -590,6 +633,7 @@ const CallPage = () => {
         setStatusLabel('Connected');
         setCallTone('connected');
       }
+      void resetChecklistForNewCall();
     } catch (error) {
       console.error('Failed to join Agora voice call', error);
       if (isComponentMountedRef.current) {
