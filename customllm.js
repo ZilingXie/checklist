@@ -6,6 +6,65 @@ import { resolve as resolvePath } from 'node:path';
 
 const MAX_BODY_SIZE = 1_000_000;
 
+const checklistDefaults = [
+  {
+    id: 'item-1',
+    question: 'Verify emergency exits remain unobstructed and clearly marked.',
+    status: 'pending',
+    recommendation: '',
+    updatedAt: new Date().toISOString()
+  },
+  {
+    id: 'item-2',
+    question: 'Confirm all fire extinguishers are inspected and tagged within the last 30 days.',
+    status: 'pending',
+    recommendation: '',
+    updatedAt: new Date().toISOString()
+  },
+  {
+    id: 'item-3',
+    question: 'Ensure incident response documentation is up to date and accessible to staff.',
+    status: 'pending',
+    recommendation: '',
+    updatedAt: new Date().toISOString()
+  }
+];
+
+let checklistItems = checklistDefaults.map((item) => ({ ...item }));
+const checklistStreams = new Set();
+
+const getChecklistSnapshot = () => ({
+  updatedAt: new Date().toISOString(),
+  items: checklistItems.map((item) => ({ ...item }))
+});
+
+const broadcastChecklistUpdate = () => {
+  const serialized = JSON.stringify(getChecklistSnapshot());
+
+  for (const stream of [...checklistStreams]) {
+    if (stream.writableEnded) {
+      checklistStreams.delete(stream);
+      continue;
+    }
+    try {
+      stream.write(`data: ${serialized}\n\n`);
+    } catch (error) {
+      console.warn('Checklist stream write failed:', error);
+      checklistStreams.delete(stream);
+    }
+  }
+};
+
+const resetChecklist = () => {
+  checklistItems = checklistDefaults.map((item) => ({
+    ...item,
+    status: 'pending',
+    recommendation: '',
+    updatedAt: new Date().toISOString()
+  }));
+  broadcastChecklistUpdate();
+};
+
 const loadDotEnvFile = (fileName) => {
   try {
     const envPath = resolvePath(process.cwd(), fileName);
@@ -135,18 +194,255 @@ const readRequestBody = (req) =>
 
 const toolRegistry = new Map();
 
-const registerTool = (name, handler) => {
-  if (!name || typeof name !== 'string') {
+const defaultToolParameters = { type: 'object', properties: {}, additionalProperties: true };
+
+const getRegisteredToolDefinitions = () =>
+  Array.from(toolRegistry.values())
+    .map((entry) => entry.definition)
+    .filter(Boolean);
+
+const registerTool = (name, handlerOrConfig, maybeConfig = {}) => {
+  if (!name || typeof name !== 'string' || !name.trim()) {
     throw new Error('Tool name must be a non-empty string');
   }
+
+  const normalizedName = name.trim();
+
+  const config =
+    typeof handlerOrConfig === 'function'
+      ? { handler: handlerOrConfig, ...maybeConfig }
+      : handlerOrConfig ?? {};
+
+  const { handler, description, parameters, strict } = config;
+
   if (typeof handler !== 'function') {
-    throw new Error(`Handler for tool "${name}" must be a function`);
+    throw new Error(`Handler for tool "${normalizedName}" must be a function`);
   }
-  toolRegistry.set(name, handler);
+
+  const definition = {
+    type: 'function',
+    function: {
+      name: normalizedName,
+      description:
+        typeof description === 'string' && description.trim()
+          ? description.trim()
+          : `Tool "${normalizedName}"`,
+      parameters:
+        parameters && typeof parameters === 'object' ? parameters : defaultToolParameters
+    }
+  };
+
+  if (strict !== undefined) {
+    definition.function.strict = Boolean(strict);
+  }
+
+  toolRegistry.set(normalizedName, { handler, definition });
 };
 
-registerTool('ping', async () => ({ status: 'ok', timestamp: Date.now() }));
-registerTool('echo', async (args = {}) => args);
+registerTool('ping', {
+  description:
+    'Health check utility. Returns status ok and the current timestamp to confirm tool execution.',
+  handler: async () => ({ status: 'ok', timestamp: Date.now() })
+});
+
+registerTool('echo', {
+  description:
+    'Returns the provided arguments unchanged. Useful for debugging tool invocation payloads.',
+  parameters: {
+    type: 'object',
+    properties: {
+      payload: {
+        description: 'Any JSON-serializable value to echo back.',
+        anyOf: [
+          { type: 'object' },
+          { type: 'string' },
+          { type: 'number' },
+          { type: 'boolean' },
+          { type: 'null' },
+          { type: 'array', items: {} }
+        ]
+      }
+    },
+    additionalProperties: true
+  },
+  handler: async (args = {}) => args
+});
+
+const knownChecklistStatuses = new Set(['pending', 'complete', 'pass', 'fail', 'warning']);
+const checklistStatusAliases = new Map([
+  ['completed', 'complete'],
+  ['done', 'complete'],
+  ['finished', 'complete'],
+  ['resolved', 'complete'],
+  ['yes', 'complete'],
+  ['y', 'complete'],
+  ['affirmative', 'complete'],
+  ['pass', 'pass'],
+  ['passed', 'pass'],
+  ['ok', 'complete'],
+  ['okay', 'complete'],
+  ['good', 'complete'],
+  ['success', 'complete'],
+  ['successful', 'complete'],
+  ['no', 'pending'],
+  ['not yet', 'pending'],
+  ['notyet', 'pending'],
+  ['incomplete', 'pending'],
+  ['pending', 'pending'],
+  ['todo', 'pending'],
+  ['to-do', 'pending'],
+  ['warning', 'warning'],
+  ['caution', 'warning'],
+  ['attention', 'warning'],
+  ['failed', 'fail'],
+  ['fail', 'fail'],
+  ['issue', 'fail'],
+  ['problem', 'fail']
+]);
+
+const normalizeChecklistStatus = (value) => {
+  if (value === undefined || value === null) return undefined;
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (knownChecklistStatuses.has(normalized)) {
+    return normalized === 'pass' ? 'complete' : normalized;
+  }
+  const alias = checklistStatusAliases.get(normalized);
+  if (alias) {
+    return alias === 'pass' ? 'complete' : alias;
+  }
+  if (normalized.startsWith('complete')) {
+    return 'complete';
+  }
+  if (normalized.startsWith('fail')) {
+    return 'fail';
+  }
+  if (normalized.includes('warn')) {
+    return 'warning';
+  }
+  if (normalized.includes('pend')) {
+    return 'pending';
+  }
+  return undefined;
+};
+
+const findChecklistItem = ({ itemId, itemNumber, itemName }) => {
+  if (itemId) {
+    const byId = checklistItems.find(
+      (item) => item.id.toLowerCase() === String(itemId).trim().toLowerCase()
+    );
+    if (byId) return byId;
+  }
+
+  if (itemNumber !== undefined && itemNumber !== null) {
+    const index = Number.parseInt(itemNumber, 10);
+    if (Number.isFinite(index) && index >= 1 && index <= checklistItems.length) {
+      return checklistItems[index - 1];
+    }
+  }
+
+  if (itemName) {
+    const normalizedName = String(itemName).trim().toLowerCase();
+    const byName = checklistItems.find((item) =>
+      item.question.toLowerCase().includes(normalizedName)
+    );
+    if (byName) return byName;
+  }
+
+  return undefined;
+};
+
+registerTool('update_checklist_item_status', {
+  description:
+    'Update the status and notes for a checklist entry. Use when the user confirms progress or completion for a specific item.',
+  parameters: {
+    type: 'object',
+    properties: {
+      item_id: {
+        type: 'string',
+        description: 'Optional unique identifier of the checklist item (e.g., "item-1").'
+      },
+      item_number: {
+        type: 'integer',
+        minimum: 1,
+        description: 'Optional 1-based index of the checklist item (e.g., 1 for the first item).'
+      },
+      item_name: {
+        type: 'string',
+        description:
+          'Optional free-form name or fragment of the checklist question to help locate the item.'
+      },
+      status: {
+        type: 'string',
+        enum: ['pending', 'complete', 'pass', 'fail', 'warning'],
+        description:
+          'New status for the item. "complete" indicates the task is done. "pending" reopens it.'
+      },
+      recommendation: {
+        type: 'string',
+        description:
+          'Optional follow-up recommendation or summary to attach to the item for the human reviewer.'
+      },
+      note: {
+        type: 'string',
+        description: 'Optional short note explaining the status update.'
+      }
+    },
+    required: ['status'],
+    additionalProperties: false
+  },
+  handler: async (args = {}) => {
+    const target =
+      findChecklistItem({
+        itemId: args.item_id,
+        itemNumber: args.item_number,
+        itemName: args.item_name
+      }) ?? null;
+
+    if (!target) {
+      return {
+        error:
+          'Unable to locate checklist item. Provide an item_id or item_number matching the checklist.'
+      };
+    }
+
+    const normalizedStatus = normalizeChecklistStatus(args.status);
+    if (!normalizedStatus) {
+      return {
+        error:
+          'Invalid status. Use one of: pending, complete, fail, warning. "pass" is treated as complete.'
+      };
+    }
+
+    const previousStatus = target.status;
+    target.status = normalizedStatus;
+    target.updatedAt = new Date().toISOString();
+
+    if (typeof args.recommendation === 'string') {
+      target.recommendation = args.recommendation;
+    } else if (typeof args.note === 'string' && !args.recommendation) {
+      target.recommendation = args.note;
+    }
+
+    broadcastChecklistUpdate();
+
+    return {
+      success: true,
+      item: { ...target },
+      previousStatus,
+      newStatus: target.status
+    };
+  }
+});
+
+registerTool('reset_checklist', {
+  description:
+    'Reset all checklist items back to a pending state. Use at the start of a new review session.',
+  handler: async () => {
+    resetChecklist();
+    return { success: true, items: getChecklistSnapshot().items };
+  }
+});
 
 const maybeLoadExternalTools = async () => {
   const toolFile = resolvePath(process.cwd(), 'customllm.tools.js');
@@ -330,7 +626,8 @@ const executeToolCall = async (call) => {
     return { error: 'Tool call is missing function name.' };
   }
 
-  const handler = toolRegistry.get(call.function.name);
+  const toolEntry = toolRegistry.get(call.function.name);
+  const handler = toolEntry?.handler;
   if (!handler) {
     return { error: `No handler registered for tool "${call.function.name}".` };
   }
@@ -389,6 +686,95 @@ const normalizeMessage = (message) => {
   }
 
   return normalized;
+};
+
+const mergeToolDefinitions = (providedTools, registeredTools) => {
+  const merged = [];
+  const seenNames = new Set();
+
+  if (Array.isArray(providedTools)) {
+    for (const tool of providedTools) {
+      if (!tool || typeof tool !== 'object') continue;
+      const toolName = tool?.function?.name;
+      if (typeof toolName === 'string' && toolName.trim()) {
+        seenNames.add(toolName.trim());
+      }
+      merged.push(tool);
+    }
+  }
+
+  for (const tool of registeredTools ?? []) {
+    if (!tool || typeof tool !== 'object') continue;
+    const toolName = tool?.function?.name;
+    if (typeof toolName === 'string' && toolName.trim()) {
+      if (seenNames.has(toolName.trim())) {
+        continue;
+      }
+    }
+    merged.push(tool);
+  }
+
+  return merged;
+};
+
+const defaultChecklistInstruction =
+  'You manage a shared compliance checklist. When the user confirms progress on an item, call the function `update_checklist_item_status` with either the item number (1-based) or id (e.g., "item-1") and set `status` to "complete" (or another appropriate value). Summarize any changes back to the user after the function call.';
+
+const ensureChecklistToolInstruction = (messages) => {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  if (!toolRegistry.has('update_checklist_item_status')) {
+    return messages;
+  }
+
+  const instruction =
+    typeof env.CUSTOM_LLM_CHECKLIST_PROMPT === 'string' &&
+    env.CUSTOM_LLM_CHECKLIST_PROMPT.trim()
+      ? env.CUSTOM_LLM_CHECKLIST_PROMPT.trim()
+      : defaultChecklistInstruction;
+
+  if (!instruction) {
+    return messages;
+  }
+
+  const alreadyIncludesInstruction = messages.some((message) => {
+    if (!message || message.role !== 'system') return false;
+    const content = message.content;
+    if (typeof content === 'string') {
+      return content.includes('update_checklist_item_status');
+    }
+    if (Array.isArray(content)) {
+      return content.some(
+        (part) =>
+          typeof part?.text === 'string' && part.text.includes('update_checklist_item_status')
+      );
+    }
+    return false;
+  });
+
+  if (alreadyIncludesInstruction) {
+    return messages;
+  }
+
+  const firstSystemIndex = messages.findIndex((message) => message?.role === 'system');
+  if (firstSystemIndex !== -1) {
+    const systemMessage = messages[firstSystemIndex];
+    if (typeof systemMessage.content === 'string') {
+      systemMessage.content = `${systemMessage.content}\n\n${instruction}`;
+      return messages;
+    }
+    if (Array.isArray(systemMessage.content)) {
+      systemMessage.content = [
+        ...systemMessage.content,
+        { type: 'text', text: instruction }
+      ];
+      return messages;
+    }
+  }
+
+  return [{ role: 'system', content: instruction }, ...messages];
 };
 
 const buildChatPayload = ({
@@ -489,6 +875,13 @@ const handleChatCompletion = async (req, res, origin) => {
     return;
   }
 
+  const registeredToolDefinitions = getRegisteredToolDefinitions();
+  const combinedTools = mergeToolDefinitions(body.tools, registeredToolDefinitions);
+  const resolvedToolChoice =
+    body.tool_choice === undefined && combinedTools.length > 0 ? 'auto' : body.tool_choice;
+
+  messages = ensureChecklistToolInstruction(messages);
+
   const responseHeaders = {
     ...buildCorsHeaders(origin),
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -510,8 +903,8 @@ const handleChatCompletion = async (req, res, origin) => {
       const payload = buildChatPayload({
         model,
         messages,
-        tools: body.tools,
-        tool_choice: body.tool_choice,
+        tools: combinedTools,
+        tool_choice: resolvedToolChoice,
         response_format: body.response_format,
         modalities: body.modalities,
         audio: body.audio,
@@ -606,6 +999,57 @@ const server = http.createServer(async (req, res) => {
 
   const requestUrl = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const pathname = requestUrl.pathname;
+
+  if (req.method === 'GET' && pathname === '/checklist') {
+    respondJson(
+      res,
+      200,
+      getChecklistSnapshot(),
+      origin,
+      { 'Cache-Control': 'no-store, no-cache, must-revalidate' }
+    );
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/checklist/stream') {
+    const headers = {
+      ...buildCorsHeaders(origin),
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive'
+    };
+    res.writeHead(200, headers);
+    res.write(`data: ${JSON.stringify(getChecklistSnapshot())}\n\n`);
+
+    checklistStreams.add(res);
+
+    const keepAlive = setInterval(() => {
+      if (res.writableEnded) {
+        clearInterval(keepAlive);
+        checklistStreams.delete(res);
+        return;
+      }
+      try {
+        res.write(': keep-alive\n\n');
+      } catch (error) {
+        console.warn('Checklist stream keep-alive failed:', error);
+        clearInterval(keepAlive);
+        checklistStreams.delete(res);
+      }
+    }, 30_000);
+
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      checklistStreams.delete(res);
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/checklist/reset') {
+    resetChecklist();
+    respondJson(res, 200, { success: true, items: getChecklistSnapshot().items }, origin);
+    return;
+  }
 
   if (req.method === 'POST' && pathname === '/chat/completions') {
     await handleChatCompletion(req, res, origin);

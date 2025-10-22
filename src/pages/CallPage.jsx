@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import AgoraRTC from 'agora-rtc-sdk-ng';
 import CallStatusBar from '../components/CallStatusBar.jsx';
@@ -30,6 +30,46 @@ const initialChecklist = [
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const sanitizeBaseUrl = (value) => {
+  if (!value || typeof value !== 'string') return '';
+  try {
+    const url = new URL(value);
+    if (url.pathname.endsWith('/chat/completions')) {
+      url.pathname = url.pathname.replace(/\/chat\/completions$/, '');
+    }
+    url.search = '';
+    url.hash = '';
+    return url.href.replace(/\/$/, '');
+  } catch {
+    return value.replace(/\/chat\/completions$/, '').replace(/\/$/, '');
+  }
+};
+
+const resolveChecklistApiBase = () => {
+  const envBase =
+    sanitizeBaseUrl(import.meta.env.VITE_CHECKLIST_API_BASE) ||
+    sanitizeBaseUrl(import.meta.env.VITE_CUSTOM_LLM_API_BASE);
+
+  if (envBase) {
+    return envBase;
+  }
+
+  const publicUrl = sanitizeBaseUrl(import.meta.env.VITE_CUSTOM_LLM_PUBLIC_URL);
+  if (publicUrl) {
+    return publicUrl;
+  }
+
+  if (typeof window !== 'undefined' && window.location) {
+    const { hostname } = window.location;
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      return 'http://localhost:3100';
+    }
+    return window.location.origin;
+  }
+
+  return 'http://localhost:3100';
+};
+
 const evaluateResponse = async ({ userText, item, nextItem }) => {
   await delay(800);
 
@@ -53,7 +93,12 @@ const evaluateResponse = async ({ userText, item, nextItem }) => {
     fail: 'Immediate action required. Assign an owner to resolve the gap and document remediation steps.'
   };
 
-  const statusText = status === 'pass' ? 'marked as pass' : status === 'fail' ? 'marked as failed' : 'set to warning';
+  const statusText =
+    status === 'pass' || status === 'complete'
+      ? 'marked as complete'
+      : status === 'fail'
+        ? 'marked as failed'
+        : 'set to warning';
   const nextPrompt = nextItem ? `Next, ${nextItem.question}` : 'That completes our checklist.';
 
   const aiResponse = `Thanks for the update. I have ${statusText} and noted: ${recommendations[status]} ${
@@ -85,6 +130,8 @@ const AGENT_CONTROLLER_AUTH_TOKEN =
 
 const CallPage = () => {
   const navigate = useNavigate();
+  const checklistApiBase = useMemo(() => resolveChecklistApiBase(), []);
+  const checklistApiBaseRef = useRef(checklistApiBase);
   const recognitionRef = useRef(null);
   const devicePermissionRequestedRef = useRef(false);
   const audioContextRef = useRef(null);
@@ -119,6 +166,114 @@ const CallPage = () => {
   useEffect(() => {
     selectedDeviceIdRef.current = selectedDeviceId;
   }, [selectedDeviceId]);
+
+  useEffect(() => {
+    checklistApiBaseRef.current = checklistApiBase;
+  }, [checklistApiBase]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+
+    const baseUrl = checklistApiBaseRef.current;
+    if (!baseUrl) return undefined;
+
+    let isCancelled = false;
+    let eventSource = null;
+    let reconnectTimer = null;
+    const abortController = new AbortController();
+
+    const applySnapshot = (snapshot) => {
+      if (!snapshot || !Array.isArray(snapshot.items) || isCancelled) {
+        return;
+      }
+
+      setChecklist(snapshot.items);
+
+      const nextPendingIndex = snapshot.items.findIndex((item) => item.status === 'pending');
+      setCurrentIndex(nextPendingIndex === -1 ? snapshot.items.length : nextPendingIndex);
+    };
+
+    const fetchInitial = async () => {
+      try {
+        const response = await fetch(`${baseUrl}/checklist`, {
+          method: 'GET',
+          signal: abortController.signal,
+          headers: { Accept: 'application/json' }
+        });
+
+        if (!response.ok) {
+          throw new Error(`Checklist fetch failed with status ${response.status}`);
+        }
+
+        const data = await response.json();
+        applySnapshot(data);
+      } catch (error) {
+        if (!abortController.signal.aborted) {
+          console.error('Unable to fetch checklist state', error);
+        }
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (reconnectTimer !== null) return;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        if (!isCancelled) {
+          connectStream();
+        }
+      }, 3000);
+    };
+
+    const connectStream = () => {
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+
+      if (typeof window.EventSource !== 'function') {
+        scheduleReconnect();
+        return;
+      }
+
+      try {
+        eventSource = new EventSource(`${baseUrl}/checklist/stream`);
+      } catch (error) {
+        console.error('Failed to start checklist stream', error);
+        scheduleReconnect();
+        return;
+      }
+
+      eventSource.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          applySnapshot(payload);
+        } catch (parseError) {
+          console.warn('Unable to parse checklist update payload', parseError);
+        }
+      };
+
+      eventSource.onerror = (event) => {
+        console.error('Checklist stream error', event);
+        eventSource?.close();
+        eventSource = null;
+        scheduleReconnect();
+      };
+    };
+
+    fetchInitial();
+    connectStream();
+
+    return () => {
+      isCancelled = true;
+      abortController.abort();
+      if (eventSource) {
+        eventSource.close();
+      }
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+    };
+  }, [checklistApiBase]);
 
   useEffect(() => {
     isComponentMountedRef.current = true;
@@ -720,12 +875,14 @@ const CallPage = () => {
       });
     } else {
       setCurrentIndex(nextIndex);
-      const passCount = updatedChecklist.filter((item) => item.status === 'pass').length;
+      const completedCount = updatedChecklist.filter(
+        (item) => item.status === 'pass' || item.status === 'complete'
+      ).length;
       const warningCount = updatedChecklist.filter((item) => item.status === 'warning').length;
       const failCount = updatedChecklist.filter((item) => item.status === 'fail').length;
 
       speakText(aiResponse, () => {
-        const summaryMessage = `Final summary: ${passCount} passed, ${warningCount} warning, ${failCount} failed. Download the reviewed checklist whenever you are ready to wrap up.`;
+        const summaryMessage = `Final summary: ${completedCount} completed, ${warningCount} warning, ${failCount} failed. Download the reviewed checklist whenever you are ready to wrap up.`;
         addConversationMessage('ai', summaryMessage);
         speakText(summaryMessage, () => {
           setCallTone('connected');
