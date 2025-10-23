@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import AgoraRTC from 'agora-rtc-sdk-ng';
 import CallStatusBar from '../components/CallStatusBar.jsx';
@@ -28,11 +28,47 @@ const initialChecklist = [
   }
 ];
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sanitizeBaseUrl = (value) => {
+  if (!value || typeof value !== 'string') return '';
+  try {
+    const url = new URL(value);
+    if (url.pathname.endsWith('/chat/completions')) {
+      url.pathname = url.pathname.replace(/\/chat\/completions$/, '');
+    }
+    url.search = '';
+    url.hash = '';
+    return url.href.replace(/\/$/, '');
+  } catch {
+    return value.replace(/\/chat\/completions$/, '').replace(/\/$/, '');
+  }
+};
 
-const evaluateResponse = async ({ userText, item, nextItem }) => {
-  await delay(800);
+const resolveChecklistApiBase = () => {
+  const envBase =
+    sanitizeBaseUrl(import.meta.env.VITE_CHECKLIST_API_BASE) ||
+    sanitizeBaseUrl(import.meta.env.VITE_CUSTOM_LLM_API_BASE);
 
+  if (envBase) {
+    return envBase;
+  }
+
+  const publicUrl = sanitizeBaseUrl(import.meta.env.VITE_CUSTOM_LLM_PUBLIC_URL);
+  if (publicUrl) {
+    return publicUrl;
+  }
+
+  if (typeof window !== 'undefined' && window.location) {
+    const { hostname } = window.location;
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      return 'http://localhost:3100';
+    }
+    return window.location.origin;
+  }
+
+  return 'http://localhost:3100';
+};
+
+const evaluateResponse = ({ userText, item, nextItem }) => {
   const normalized = userText.toLowerCase();
   let status = 'pass';
 
@@ -53,7 +89,12 @@ const evaluateResponse = async ({ userText, item, nextItem }) => {
     fail: 'Immediate action required. Assign an owner to resolve the gap and document remediation steps.'
   };
 
-  const statusText = status === 'pass' ? 'marked as pass' : status === 'fail' ? 'marked as failed' : 'set to warning';
+  const statusText =
+    status === 'pass' || status === 'complete'
+      ? 'marked as complete'
+      : status === 'fail'
+        ? 'marked as failed'
+        : 'set to warning';
   const nextPrompt = nextItem ? `Next, ${nextItem.question}` : 'That completes our checklist.';
 
   const aiResponse = `Thanks for the update. I have ${statusText} and noted: ${recommendations[status]} ${
@@ -72,9 +113,21 @@ const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
 const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN || null;
 const parsedAgoraUid = Number.parseInt(import.meta.env.VITE_AGORA_UID ?? '', 10);
 const AGORA_UID = Number.isFinite(parsedAgoraUid) ? parsedAgoraUid : null;
+const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
+const AGENT_CONTROLLER_URL =
+  import.meta.env.VITE_AGENT_CONTROLLER_URL ?? import.meta.env.VITE_AI_AGENT_SERVER_URL ?? '';
+const AGENT_LEAVE_ENDPOINT = AGENT_CONTROLLER_URL
+  ? `${AGENT_CONTROLLER_URL.replace(/\/$/, '')}/agent/leave`
+  : '';
+const AGENT_CONTROLLER_AUTH_TOKEN =
+  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_TOKEN ??
+  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_SECRET ??
+  '';
 
 const CallPage = () => {
   const navigate = useNavigate();
+  const checklistApiBase = useMemo(() => resolveChecklistApiBase(), []);
+  const checklistApiBaseRef = useRef(checklistApiBase);
   const recognitionRef = useRef(null);
   const devicePermissionRequestedRef = useRef(false);
   const audioContextRef = useRef(null);
@@ -88,9 +141,10 @@ const CallPage = () => {
   const agoraLocalAudioTrackRef = useRef(null);
   const remoteAudioTracksRef = useRef(new Map());
   const agoraSessionContextRef = useRef(null);
+  const hasResetChecklistRef = useRef(false);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
-  const [callTone, setCallTone] = useState('connected');
-  const [statusLabel, setStatusLabel] = useState('AI Assistant - Connected');
+  const [callTone, setCallTone] = useState('connecting');
+  const [statusLabel, setStatusLabel] = useState('Connecting…');
   const [conversation, setConversation] = useState([]);
   const [checklist, setChecklist] = useState(initialChecklist);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -109,6 +163,282 @@ const CallPage = () => {
   useEffect(() => {
     selectedDeviceIdRef.current = selectedDeviceId;
   }, [selectedDeviceId]);
+
+  useEffect(() => {
+    checklistApiBaseRef.current = checklistApiBase;
+  }, [checklistApiBase]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+
+    const baseUrl = checklistApiBaseRef.current;
+    if (!baseUrl) return undefined;
+
+    console.debug('Using checklist API base:', baseUrl);
+
+    let isCancelled = false;
+    let reconnectTimer = null;
+    let fetchRetryTimer = null;
+    let streamAbortController = null;
+    const abortController = new AbortController();
+
+    const applySnapshot = (snapshot) => {
+      if (!snapshot || !Array.isArray(snapshot.items) || isCancelled) {
+        return;
+      }
+
+      setChecklist(snapshot.items);
+
+      const nextPendingIndex = snapshot.items.findIndex((item) => item.status === 'pending');
+      setCurrentIndex(nextPendingIndex === -1 ? snapshot.items.length : nextPendingIndex);
+    };
+
+    const scheduleFetchRetry = () => {
+      if (fetchRetryTimer !== null) return;
+      fetchRetryTimer = window.setTimeout(() => {
+        fetchRetryTimer = null;
+        if (!isCancelled) {
+          fetchInitial();
+        }
+      }, 3000);
+    };
+
+    const fetchInitial = async () => {
+      try {
+        const response = await fetch(
+          `${baseUrl}/checklist?ngrok-skip-browser-warning=true`,
+          {
+            method: 'GET',
+            signal: abortController.signal,
+            headers: {
+              Accept: 'application/json',
+              'ngrok-skip-browser-warning': 'true'
+            },
+            cache: 'no-store'
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(`Checklist fetch failed with status ${response.status}`);
+        }
+
+        const rawBody = await response.text();
+
+        if (!rawBody) {
+          console.warn('Checklist fetch returned an empty payload; retrying shortly.');
+          scheduleFetchRetry();
+          return;
+        }
+
+        let data;
+
+        try {
+          data = JSON.parse(rawBody);
+        } catch (parseError) {
+          const preview = rawBody.slice(0, 160);
+          console.error('Checklist response was not valid JSON', {
+            error: parseError,
+            status: response.status,
+            contentType: response.headers.get('content-type'),
+            preview
+          });
+          scheduleFetchRetry();
+          return;
+        }
+
+        applySnapshot(data);
+      } catch (error) {
+        if (!abortController.signal.aborted) {
+          console.error('Unable to fetch checklist state', error);
+          scheduleFetchRetry();
+        }
+      }
+    };
+
+    const closeStream = () => {
+      if (streamAbortController) {
+        streamAbortController.abort();
+        streamAbortController = null;
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (reconnectTimer !== null) return;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        if (!isCancelled) {
+          void connectStream();
+        }
+      }, 3000);
+    };
+
+    const connectStream = async () => {
+      closeStream();
+
+      const controller = new AbortController();
+      streamAbortController = controller;
+
+      try {
+        const response = await fetch(
+          `${baseUrl}/checklist/stream?ngrok-skip-browser-warning=true`,
+          {
+            method: 'GET',
+            headers: {
+              Accept: 'text/event-stream',
+              'ngrok-skip-browser-warning': 'true'
+            },
+            cache: 'no-store',
+            signal: controller.signal
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error(`Checklist stream failed with status ${response.status}`);
+        }
+
+        if (!response.body) {
+          throw new Error('Checklist stream response does not have a readable body.');
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        const processBuffer = () => {
+          let separatorIndex;
+          while ((separatorIndex = buffer.indexOf('\n\n')) !== -1) {
+            const rawEvent = buffer.slice(0, separatorIndex);
+            buffer = buffer.slice(separatorIndex + 2);
+
+            if (!rawEvent.trim()) {
+              continue;
+            }
+
+            const dataLines = [];
+            for (const line of rawEvent.split(/\n/)) {
+              if (!line) continue;
+              if (line.startsWith(':')) {
+                continue;
+              }
+              if (line.startsWith('data:')) {
+                dataLines.push(line.slice(5).trimStart());
+              }
+            }
+
+            if (dataLines.length === 0) {
+              continue;
+            }
+
+            const payloadText = dataLines.join('\n');
+            if (!payloadText) {
+              continue;
+            }
+
+            try {
+              const payload = JSON.parse(payloadText);
+              applySnapshot(payload);
+            } catch (parseError) {
+              console.warn('Unable to parse checklist stream payload', {
+                error: parseError,
+                payloadText
+              });
+            }
+          }
+        };
+
+        while (!isCancelled) {
+          const { value, done } = await reader.read();
+          if (done) {
+            if (value) {
+              buffer += decoder.decode(value, { stream: true });
+            }
+            break;
+          }
+
+          if (value) {
+            buffer += decoder.decode(value, { stream: true });
+            processBuffer();
+          }
+        }
+
+        buffer += decoder.decode(new Uint8Array(), { stream: false });
+        processBuffer();
+      } catch (error) {
+        if (!controller.signal.aborted && !isCancelled) {
+          console.error('Checklist stream error', error);
+        }
+      } finally {
+        if (streamAbortController === controller) {
+          streamAbortController = null;
+        }
+        if (!isCancelled && !controller.signal.aborted) {
+          scheduleReconnect();
+        }
+      }
+    };
+
+    fetchInitial();
+    void connectStream();
+
+    return () => {
+      isCancelled = true;
+      abortController.abort();
+      closeStream();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+      if (fetchRetryTimer !== null) {
+        window.clearTimeout(fetchRetryTimer);
+      }
+    };
+  }, [checklistApiBase]);
+
+  const resetChecklistForNewCall = async () => {
+    if (!isComponentMountedRef.current) return;
+    if (hasResetChecklistRef.current) return;
+
+    hasResetChecklistRef.current = true;
+
+    setChecklist((previous) =>
+      previous.map((item) => ({
+        ...item,
+        status: 'pending',
+        recommendation: ''
+      }))
+    );
+    setCurrentIndex(0);
+
+    const baseUrl = checklistApiBaseRef.current;
+    if (!baseUrl) {
+      console.warn('Checklist API base URL is not available; skipping remote reset request.');
+      return;
+    }
+
+    try {
+      const response = await fetch(
+        `${baseUrl}/checklist/reset?ngrok-skip-browser-warning=true`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'ngrok-skip-browser-warning': 'true'
+          },
+          cache: 'no-store'
+        }
+      );
+
+      if (!response.ok) {
+        console.error('Checklist reset request failed', {
+          status: response.status,
+          statusText: response.statusText
+        });
+        hasResetChecklistRef.current = false;
+      }
+    } catch (error) {
+      console.error('Checklist reset request failed', error);
+      hasResetChecklistRef.current = false;
+    }
+  };
 
   useEffect(() => {
     isComponentMountedRef.current = true;
@@ -144,7 +474,7 @@ const CallPage = () => {
     recognition.onend = () => {
       if (callActive && !isProcessing) {
         setCallTone('listening');
-        setStatusLabel('Listening for your response…');
+        setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
       }
     };
 
@@ -356,17 +686,25 @@ const CallPage = () => {
       agoraClientRef.current = null;
       if (isComponentMountedRef.current) {
         setAgoraJoined(false);
+        setStatusLabel('Disconnected');
+        setCallTone('idle');
       }
     }
     if (sessionContext && agoraSessionContextRef.current === sessionContext) {
       agoraSessionContextRef.current = null;
     }
+    hasResetChecklistRef.current = false;
   };
 
   const joinAgoraVoiceCall = async (sessionContext = agoraSessionContextRef.current) => {
     if (!callActive) return;
     if (!AGORA_APP_ID || !AGORA_CHANNEL) {
       console.warn('Missing Agora credentials. Voice call join skipped.');
+      if (isComponentMountedRef.current) {
+        setStatusLabel('Connected');
+        setCallTone('connected');
+      }
+      void resetChecklistForNewCall();
       return;
     }
 
@@ -377,6 +715,10 @@ const CallPage = () => {
     } catch (error) {
       console.error('Microphone permission is required for Agora voice call', error);
       setDeviceStatusMessage('Allow microphone access to join the voice call.');
+      if (isComponentMountedRef.current) {
+        setStatusLabel('Connection failed');
+        setCallTone('idle');
+      }
       return;
     }
 
@@ -395,6 +737,9 @@ const CallPage = () => {
     }
 
     try {
+      setCallTone('connecting');
+      setStatusLabel('Connecting…');
+
       await client.join(AGORA_APP_ID, AGORA_CHANNEL, AGORA_TOKEN || null, AGORA_UID ?? null);
       const trackConfig =
         selectedDeviceIdRef.current && selectedDeviceIdRef.current !== 'default'
@@ -406,11 +751,20 @@ const CallPage = () => {
         sessionContext.localTrack = localAudioTrack;
       }
       await client.publish([localAudioTrack]);
-      setAgoraJoined(true);
-      setDeviceStatusMessage('');
+      if (isComponentMountedRef.current) {
+        setAgoraJoined(true);
+        setDeviceStatusMessage('');
+        setStatusLabel('Connected');
+        setCallTone('connected');
+      }
+      void resetChecklistForNewCall();
     } catch (error) {
       console.error('Failed to join Agora voice call', error);
-      setDeviceStatusMessage('Unable to join the voice call. Check Agora configuration or permissions.');
+      if (isComponentMountedRef.current) {
+        setDeviceStatusMessage('Unable to join the voice call. Check Agora configuration or permissions.');
+        setStatusLabel('Connection failed');
+        setCallTone('idle');
+      }
     }
   };
 
@@ -614,12 +968,12 @@ const CallPage = () => {
     utterance.pitch = 1;
 
     setCallTone('speaking');
-    setStatusLabel('AI Speaking…');
+    setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
 
     utterance.onend = () => {
       if (!callActive) return;
       setCallTone('listening');
-      setStatusLabel('Listening for your response…');
+      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
       onComplete?.();
     };
 
@@ -634,7 +988,7 @@ const CallPage = () => {
     try {
       recognition.start();
       setCallTone('listening');
-      setStatusLabel('Listening for your response…');
+      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
     } catch {
       // recognition already started, ignore
     }
@@ -653,12 +1007,12 @@ const CallPage = () => {
 
     setIsProcessing(true);
     setCallTone('connected');
-    setStatusLabel('Processing your response…');
+    setStatusLabel('Processing…');
 
     const currentItem = checklist[currentIndex];
     const nextItem = checklist[currentIndex + 1];
 
-    const { status, recommendation, aiResponse } = await evaluateResponse({
+    const { status, recommendation, aiResponse } = evaluateResponse({
       userText: text,
       item: currentItem,
       nextItem
@@ -689,16 +1043,18 @@ const CallPage = () => {
       });
     } else {
       setCurrentIndex(nextIndex);
-      const passCount = updatedChecklist.filter((item) => item.status === 'pass').length;
+      const completedCount = updatedChecklist.filter(
+        (item) => item.status === 'pass' || item.status === 'complete'
+      ).length;
       const warningCount = updatedChecklist.filter((item) => item.status === 'warning').length;
       const failCount = updatedChecklist.filter((item) => item.status === 'fail').length;
 
       speakText(aiResponse, () => {
-        const summaryMessage = `Final summary: ${passCount} passed, ${warningCount} warning, ${failCount} failed. Download the reviewed checklist whenever you are ready to wrap up.`;
+        const summaryMessage = `Final summary: ${completedCount} completed, ${warningCount} warning, ${failCount} failed. Download the reviewed checklist whenever you are ready to wrap up.`;
         addConversationMessage('ai', summaryMessage);
         speakText(summaryMessage, () => {
           setCallTone('connected');
-          setStatusLabel('Review complete.');
+          setStatusLabel('Review complete');
         });
       });
     }
@@ -718,6 +1074,80 @@ const CallPage = () => {
     window.URL.revokeObjectURL(url);
   };
 
+  const stopAgoraAgent = async () => {
+    if (typeof window === 'undefined' || typeof window.sessionStorage === 'undefined') {
+      return;
+    }
+
+    const storage = window.sessionStorage;
+    const serialized = storage.getItem(AGORA_AGENT_LAST_JOIN_KEY);
+    if (!serialized) {
+      return;
+    }
+
+    let storedDetails;
+    try {
+      storedDetails = JSON.parse(serialized);
+    } catch (error) {
+      console.warn('Unable to parse stored Agora agent session details', error);
+      storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
+      return;
+    }
+
+    const agentId = storedDetails?.agentId ?? storedDetails?.agent_id ?? storedDetails?.id;
+    const projectId = storedDetails?.projectId ?? AGORA_APP_ID;
+    const leaveUrl =
+      storedDetails?.leaveUrl ??
+      (agentId && projectId
+        ? `https://api.agora.io/api/conversational-ai-agent/v2/projects/${projectId}/agents/${agentId}/leave`
+        : undefined);
+
+    if (!AGENT_LEAVE_ENDPOINT || typeof fetch !== 'function') {
+      storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
+      return;
+    }
+
+    if (!agentId) {
+      console.warn('Unable to resolve Agora agent identifier; skipping leave request.');
+      storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
+      return;
+    }
+
+    try {
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+
+      if (AGENT_CONTROLLER_AUTH_TOKEN) {
+        headers.Authorization = `Bearer ${AGENT_CONTROLLER_AUTH_TOKEN}`;
+      }
+
+      const response = await fetch(AGENT_LEAVE_ENDPOINT, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          agentId,
+          projectId: storedDetails?.projectId ?? AGORA_APP_ID,
+          leaveUrl
+        }),
+        keepalive: true
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        console.error('Agent controller leave request failed', {
+          status: response.status,
+          statusText: response.statusText,
+          body: errorText
+        });
+      }
+    } catch (error) {
+      console.error('Failed to invoke agent controller leave request', error);
+    } finally {
+      storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
+    }
+  };
+
   const handleEndCall = async () => {
     setCallActive(false);
     stopListening();
@@ -730,6 +1160,7 @@ const CallPage = () => {
       audioContextRef.current = null;
     }
     setIsDeviceMenuOpen(false);
+    void stopAgoraAgent();
     navigate('/');
   };
 
@@ -755,13 +1186,13 @@ const CallPage = () => {
   return (
     <div className="flex min-h-screen flex-col gap-6 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 p-6 text-white">
       <CallStatusBar statusLabel={statusLabel} tone={callTone} />
-      <div className="flex flex-1 flex-col gap-6 lg:flex-row">
-        <div className="flex flex-1 flex-col gap-6">
-          <ConversationVisualizer tone={callTone} />
-          <TranscriptPanel conversation={conversation} />
-        </div>
-        <div className="lg:w-[28rem]">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] xl:grid-cols-[minmax(0,1fr)_24rem]">
+        <div className="flex min-h-0">
           <ChecklistSidebar items={checklist} />
+        </div>
+        <div className="flex min-h-0 flex-col gap-6">
+          <ConversationVisualizer tone={callTone} isConnected={agoraJoined} />
+          <TranscriptPanel conversation={conversation} />
         </div>
       </div>
       <CallControls
