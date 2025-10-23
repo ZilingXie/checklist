@@ -138,9 +138,9 @@ const resolveCorsOrigin = (requestOrigin) => {
 
 const buildCorsHeaders = (origin) => {
   const headers = {
-    'Access-Control-Allow-Methods': 'POST,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
     'Access-Control-Allow-Headers':
-      'Content-Type, Authorization, X-Requested-With, X-Agent-Auth, X-Api-Key'
+      'Content-Type, Authorization, X-Requested-With, X-Agent-Auth, X-Api-Key, Last-Event-ID, ngrok-skip-browser-warning'
   };
   if (origin) {
     headers['Access-Control-Allow-Origin'] = origin;

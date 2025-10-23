@@ -178,9 +178,12 @@ const CallPage = () => {
     const baseUrl = checklistApiBaseRef.current;
     if (!baseUrl) return undefined;
 
+    console.debug('Using checklist API base:', baseUrl);
+
     let isCancelled = false;
-    let eventSource = null;
     let reconnectTimer = null;
+    let fetchRetryTimer = null;
+    let streamAbortController = null;
     const abortController = new AbortController();
 
     const applySnapshot = (snapshot) => {
@@ -194,24 +197,72 @@ const CallPage = () => {
       setCurrentIndex(nextPendingIndex === -1 ? snapshot.items.length : nextPendingIndex);
     };
 
+    const scheduleFetchRetry = () => {
+      if (fetchRetryTimer !== null) return;
+      fetchRetryTimer = window.setTimeout(() => {
+        fetchRetryTimer = null;
+        if (!isCancelled) {
+          fetchInitial();
+        }
+      }, 3000);
+    };
+
     const fetchInitial = async () => {
       try {
-        const response = await fetch(`${baseUrl}/checklist`, {
-          method: 'GET',
-          signal: abortController.signal,
-          headers: { Accept: 'application/json' }
-        });
+        const response = await fetch(
+          `${baseUrl}/checklist?ngrok-skip-browser-warning=true`,
+          {
+            method: 'GET',
+            signal: abortController.signal,
+            headers: {
+              Accept: 'application/json',
+              'ngrok-skip-browser-warning': 'true'
+            },
+            cache: 'no-store'
+          }
+        );
 
         if (!response.ok) {
           throw new Error(`Checklist fetch failed with status ${response.status}`);
         }
 
-        const data = await response.json();
+        const rawBody = await response.text();
+
+        if (!rawBody) {
+          console.warn('Checklist fetch returned an empty payload; retrying shortly.');
+          scheduleFetchRetry();
+          return;
+        }
+
+        let data;
+
+        try {
+          data = JSON.parse(rawBody);
+        } catch (parseError) {
+          const preview = rawBody.slice(0, 160);
+          console.error('Checklist response was not valid JSON', {
+            error: parseError,
+            status: response.status,
+            contentType: response.headers.get('content-type'),
+            preview
+          });
+          scheduleFetchRetry();
+          return;
+        }
+
         applySnapshot(data);
       } catch (error) {
         if (!abortController.signal.aborted) {
           console.error('Unable to fetch checklist state', error);
+          scheduleFetchRetry();
         }
+      }
+    };
+
+    const closeStream = () => {
+      if (streamAbortController) {
+        streamAbortController.abort();
+        streamAbortController = null;
       }
     };
 
@@ -220,58 +271,128 @@ const CallPage = () => {
       reconnectTimer = window.setTimeout(() => {
         reconnectTimer = null;
         if (!isCancelled) {
-          connectStream();
+          void connectStream();
         }
       }, 3000);
     };
 
-    const connectStream = () => {
-      if (eventSource) {
-        eventSource.close();
-        eventSource = null;
-      }
+    const connectStream = async () => {
+      closeStream();
 
-      if (typeof window.EventSource !== 'function') {
-        scheduleReconnect();
-        return;
-      }
+      const controller = new AbortController();
+      streamAbortController = controller;
 
       try {
-        eventSource = new EventSource(`${baseUrl}/checklist/stream`);
-      } catch (error) {
-        console.error('Failed to start checklist stream', error);
-        scheduleReconnect();
-        return;
-      }
+        const response = await fetch(
+          `${baseUrl}/checklist/stream?ngrok-skip-browser-warning=true`,
+          {
+            method: 'GET',
+            headers: {
+              Accept: 'text/event-stream',
+              'ngrok-skip-browser-warning': 'true'
+            },
+            cache: 'no-store',
+            signal: controller.signal
+          }
+        );
 
-      eventSource.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data);
-          applySnapshot(payload);
-        } catch (parseError) {
-          console.warn('Unable to parse checklist update payload', parseError);
+        if (!response.ok) {
+          throw new Error(`Checklist stream failed with status ${response.status}`);
         }
-      };
 
-      eventSource.onerror = (event) => {
-        console.error('Checklist stream error', event);
-        eventSource?.close();
-        eventSource = null;
-        scheduleReconnect();
-      };
+        if (!response.body) {
+          throw new Error('Checklist stream response does not have a readable body.');
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        const processBuffer = () => {
+          let separatorIndex;
+          while ((separatorIndex = buffer.indexOf('\n\n')) !== -1) {
+            const rawEvent = buffer.slice(0, separatorIndex);
+            buffer = buffer.slice(separatorIndex + 2);
+
+            if (!rawEvent.trim()) {
+              continue;
+            }
+
+            const dataLines = [];
+            for (const line of rawEvent.split(/\n/)) {
+              if (!line) continue;
+              if (line.startsWith(':')) {
+                continue;
+              }
+              if (line.startsWith('data:')) {
+                dataLines.push(line.slice(5).trimStart());
+              }
+            }
+
+            if (dataLines.length === 0) {
+              continue;
+            }
+
+            const payloadText = dataLines.join('\n');
+            if (!payloadText) {
+              continue;
+            }
+
+            try {
+              const payload = JSON.parse(payloadText);
+              applySnapshot(payload);
+            } catch (parseError) {
+              console.warn('Unable to parse checklist stream payload', {
+                error: parseError,
+                payloadText
+              });
+            }
+          }
+        };
+
+        while (!isCancelled) {
+          const { value, done } = await reader.read();
+          if (done) {
+            if (value) {
+              buffer += decoder.decode(value, { stream: true });
+            }
+            break;
+          }
+
+          if (value) {
+            buffer += decoder.decode(value, { stream: true });
+            processBuffer();
+          }
+        }
+
+        buffer += decoder.decode(new Uint8Array(), { stream: false });
+        processBuffer();
+      } catch (error) {
+        if (!controller.signal.aborted && !isCancelled) {
+          console.error('Checklist stream error', error);
+        }
+      } finally {
+        if (streamAbortController === controller) {
+          streamAbortController = null;
+        }
+        if (!isCancelled && !controller.signal.aborted) {
+          scheduleReconnect();
+        }
+      }
     };
 
     fetchInitial();
-    connectStream();
+    void connectStream();
 
     return () => {
       isCancelled = true;
       abortController.abort();
-      if (eventSource) {
-        eventSource.close();
-      }
+      closeStream();
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
+      }
+      if (fetchRetryTimer !== null) {
+        window.clearTimeout(fetchRetryTimer);
       }
     };
   }, [checklistApiBase]);
@@ -298,10 +419,17 @@ const CallPage = () => {
     }
 
     try {
-      const response = await fetch(`${baseUrl}/checklist/reset`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      });
+      const response = await fetch(
+        `${baseUrl}/checklist/reset?ngrok-skip-browser-warning=true`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'ngrok-skip-browser-warning': 'true'
+          },
+          cache: 'no-store'
+        }
+      );
 
       if (!response.ok) {
         console.error('Checklist reset request failed', {
