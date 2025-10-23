@@ -559,6 +559,237 @@ const callChatApi = async (payload) => {
   }
 };
 
+const appendTextContent = (existing, delta) => {
+  let result = typeof existing === 'string' ? existing : '';
+  if (delta === undefined || delta === null) {
+    return result;
+  }
+
+  const pieces = Array.isArray(delta) ? delta : [delta];
+  for (const piece of pieces) {
+    if (!piece) continue;
+    if (typeof piece === 'string') {
+      result += piece;
+      continue;
+    }
+
+    if (typeof piece === 'object') {
+      if (typeof piece.text === 'string') {
+        result += piece.text;
+        continue;
+      }
+      if (typeof piece.content === 'string') {
+        result += piece.content;
+        continue;
+      }
+      if (typeof piece.value === 'string') {
+        result += piece.value;
+        continue;
+      }
+    }
+  }
+
+  return result;
+};
+
+const mergeToolCallDeltas = (existing = [], deltas) => {
+  if (!Array.isArray(deltas) || deltas.length === 0) {
+    return existing;
+  }
+
+  for (const delta of deltas) {
+    if (!delta) continue;
+    const index =
+      typeof delta.index === 'number' && Number.isInteger(delta.index) && delta.index >= 0
+        ? delta.index
+        : existing.length;
+
+    if (!existing[index]) {
+      existing[index] = {
+        id: delta.id ?? null,
+        type: delta.type ?? 'function',
+        function: { name: '', arguments: '' }
+      };
+    }
+
+    const target = existing[index];
+
+    if (delta.id) {
+      target.id = delta.id;
+    }
+    if (delta.type) {
+      target.type = delta.type;
+    }
+
+    if (!target.function) {
+      target.function = { name: '', arguments: '' };
+    }
+
+    if (delta.function) {
+      if (delta.function.name) {
+        target.function.name = delta.function.name;
+      }
+      if (delta.function.arguments) {
+        target.function.arguments = (target.function.arguments ?? '') + delta.function.arguments;
+      }
+    }
+  }
+
+  return existing;
+};
+
+const callChatApiStream = async (payload, { onChunk } = {}) => {
+  if (!apiKey) {
+    throw new Error(
+      'CUSTOM_LLM_API_KEY (or AGORA_AGENT_LLM_API_KEY / OPENAI_API_KEY) is required for proxying requests.'
+    );
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const streamPayload = { ...payload, stream: true };
+
+  try {
+    const response = await fetch(baseUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(streamPayload),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `Upstream LLM request failed with status ${response.status}: ${errorText}`
+      );
+    }
+
+    if (!response.body) {
+      throw new Error('Upstream LLM response did not include a readable stream.');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let finished = false;
+    const message = {
+      role: 'assistant',
+      content: '',
+      tool_calls: [],
+      audio: undefined
+    };
+    let finishReason = null;
+
+    const processBuffer = () => {
+      let separatorIndex;
+      while ((separatorIndex = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+
+        const dataLines = rawEvent
+          .split('\n')
+          .map((line) => line.trim())
+          .filter((line) => line && !line.startsWith(':') && line.startsWith('data:'))
+          .map((line) => line.slice(5).trim());
+
+        if (dataLines.length === 0) {
+          continue;
+        }
+
+        for (const dataLine of dataLines) {
+          if (!dataLine) continue;
+          if (dataLine === '[DONE]') {
+            finishReason = finishReason ?? 'stop';
+            return true;
+          }
+
+          let parsed;
+          try {
+            parsed = JSON.parse(dataLine);
+          } catch (error) {
+            console.warn('Unable to parse upstream stream chunk:', error);
+            continue;
+          }
+
+          try {
+            onChunk?.(parsed);
+          } catch (error) {
+            console.warn('onChunk handler threw an error:', error);
+          }
+
+          const choice = parsed.choices?.[0];
+          if (!choice) {
+            continue;
+          }
+
+          const delta = choice.delta ?? {};
+
+          if (delta.role) {
+            message.role = delta.role;
+          }
+
+          if (delta.content !== undefined) {
+            message.content = appendTextContent(message.content, delta.content);
+          }
+
+          if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+            message.tool_calls = mergeToolCallDeltas(message.tool_calls, delta.tool_calls);
+          }
+
+          if (delta.audio) {
+            message.audio = { ...(message.audio ?? {}), ...delta.audio };
+          }
+
+          if (choice.finish_reason) {
+            finishReason = choice.finish_reason;
+          }
+        }
+      }
+      return false;
+    };
+
+    while (!finished) {
+      const { value, done } = await reader.read();
+      if (done) {
+        if (value && value.length > 0) {
+          buffer += decoder.decode(value, { stream: true });
+        }
+        buffer += decoder.decode(new Uint8Array(), { stream: false });
+        finished = true;
+      } else if (value) {
+        buffer += decoder.decode(value, { stream: true });
+      }
+
+      const encounteredDone = processBuffer();
+      if (encounteredDone) {
+        break;
+      }
+    }
+
+    message.tool_calls = (message.tool_calls ?? [])
+      .filter(Boolean)
+      .map((call) => ({
+        id: call.id ?? null,
+        type: call.type ?? 'function',
+        function: {
+          name: call.function?.name ?? '',
+          arguments: call.function?.arguments ?? ''
+        }
+      }));
+
+    if (!message.content) {
+      message.content = '';
+    }
+
+    return { message, finishReason: finishReason ?? 'stop' };
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 const sendSseChunk = (res, chunk) => {
   res.write(`data: ${JSON.stringify(chunk)}\n\n`);
 };
@@ -914,26 +1145,76 @@ const handleChatCompletion = async (req, res, origin) => {
         stream: false
       });
 
-      const upstreamResponse = await callChatApi(payload);
-      const choice = upstreamResponse?.choices?.[0];
-      const assistantMessage = choice?.message;
+      let assistantMessage;
+      let streamingSucceeded = false;
+      let streamedAudio = false;
+      let roleChunkSent = false;
 
-      if (!choice || !assistantMessage) {
-        throw new Error('Upstream LLM returned an unexpected response.');
+      const ensureRoleChunk = (roleValue) => {
+        if (roleChunkSent) {
+          return;
+        }
+        sendRoleChunk(res, model, roleValue ?? 'assistant');
+        roleChunkSent = true;
+      };
+
+      try {
+        const streamResult = await callChatApiStream(payload, {
+          onChunk: (chunk) => {
+            const choice = chunk?.choices?.[0];
+            if (!choice) return;
+
+            const delta = choice.delta ?? {};
+            ensureRoleChunk(delta.role);
+
+            if (delta.content !== undefined) {
+              sendContentChunks(res, model, delta.content ?? []);
+            }
+
+            if (delta.audio) {
+              const audioChunk = createChunkBase(model);
+              audioChunk.choices[0].delta.audio = delta.audio;
+              sendSseChunk(res, audioChunk);
+              streamedAudio = true;
+            }
+          }
+        });
+
+        assistantMessage = streamResult.message;
+        streamingSucceeded = true;
+      } catch (streamError) {
+        console.warn(
+          'Streaming upstream completion failed, falling back to non-streaming request.',
+          streamError
+        );
       }
 
-      sendRoleChunk(res, model, 'assistant');
+      if (!streamingSucceeded) {
+        const upstreamResponse = await callChatApi(payload);
+        const choice = upstreamResponse?.choices?.[0];
+        assistantMessage = choice?.message;
 
-      if (assistantMessage.tool_calls?.length) {
-        sendToolCallChunk(res, model, assistantMessage.tool_calls);
+        if (!assistantMessage) {
+          throw new Error('Upstream LLM returned an unexpected response.');
+        }
+      }
+
+      ensureRoleChunk(assistantMessage.role ?? 'assistant');
+
+      const toolCalls = Array.isArray(assistantMessage.tool_calls)
+        ? assistantMessage.tool_calls.filter(Boolean)
+        : [];
+
+      if (toolCalls.length > 0) {
+        sendToolCallChunk(res, model, toolCalls);
 
         messages.push({
           role: 'assistant',
           content: assistantMessage.content ?? null,
-          tool_calls: assistantMessage.tool_calls
+          tool_calls: toolCalls
         });
 
-        for (const call of assistantMessage.tool_calls) {
+        for (const call of toolCalls) {
           const toolResult = await executeToolCall(call);
           const toolMessage = {
             role: 'tool',
@@ -947,9 +1228,11 @@ const handleChatCompletion = async (req, res, origin) => {
         continue;
       }
 
-      sendContentChunks(res, model, assistantMessage.content ?? []);
+      if (!streamingSucceeded) {
+        sendContentChunks(res, model, assistantMessage.content ?? []);
+      }
 
-      if (assistantMessage.audio) {
+      if (assistantMessage.audio && !streamedAudio) {
         const audioChunk = createChunkBase(model);
         audioChunk.choices[0].delta.audio = assistantMessage.audio;
         sendSseChunk(res, audioChunk);

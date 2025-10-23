@@ -28,8 +28,6 @@ const initialChecklist = [
   }
 ];
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const sanitizeBaseUrl = (value) => {
   if (!value || typeof value !== 'string') return '';
   try {
@@ -70,9 +68,7 @@ const resolveChecklistApiBase = () => {
   return 'http://localhost:3100';
 };
 
-const evaluateResponse = async ({ userText, item, nextItem }) => {
-  await delay(800);
-
+const evaluateResponse = ({ userText, item, nextItem }) => {
   const normalized = userText.toLowerCase();
   let status = 'pass';
 
@@ -1016,7 +1012,7 @@ const CallPage = () => {
     const currentItem = checklist[currentIndex];
     const nextItem = checklist[currentIndex + 1];
 
-    const { status, recommendation, aiResponse } = await evaluateResponse({
+    const { status, recommendation, aiResponse } = evaluateResponse({
       userText: text,
       item: currentItem,
       nextItem
