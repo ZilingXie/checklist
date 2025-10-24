@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom';
 import AgoraRTC from 'agora-rtc-sdk-ng';
 import CallStatusBar from '../components/CallStatusBar.jsx';
 import ConversationVisualizer from '../components/ConversationVisualizer.jsx';
-import TranscriptPanel from '../components/TranscriptPanel.jsx';
 import ChecklistSidebar from '../components/ChecklistSidebar.jsx';
 import CallControls from '../components/CallControls.jsx';
 
@@ -68,7 +67,7 @@ const resolveChecklistApiBase = () => {
   return 'http://localhost:3100';
 };
 
-const evaluateResponse = ({ userText, item, nextItem }) => {
+const evaluateResponse = ({ userText }) => {
   const normalized = userText.toLowerCase();
   let status = 'pass';
 
@@ -89,22 +88,9 @@ const evaluateResponse = ({ userText, item, nextItem }) => {
     fail: 'Immediate action required. Assign an owner to resolve the gap and document remediation steps.'
   };
 
-  const statusText =
-    status === 'pass' || status === 'complete'
-      ? 'marked as complete'
-      : status === 'fail'
-        ? 'marked as failed'
-        : 'set to warning';
-  const nextPrompt = nextItem ? `Next, ${nextItem.question}` : 'That completes our checklist.';
-
-  const aiResponse = `Thanks for the update. I have ${statusText} and noted: ${recommendations[status]} ${
-    nextItem ? nextPrompt : 'Here is a summary of our findings.'
-  }`;
-
   return {
     status,
-    recommendation: recommendations[status],
-    aiResponse
+    recommendation: recommendations[status]
   };
 };
 
@@ -145,7 +131,6 @@ const CallPage = () => {
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('connecting');
   const [statusLabel, setStatusLabel] = useState('Connecting…');
-  const [conversation, setConversation] = useState([]);
   const [checklist, setChecklist] = useState(initialChecklist);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [callActive, setCallActive] = useState(true);
@@ -443,10 +428,9 @@ const CallPage = () => {
   useEffect(() => {
     isComponentMountedRef.current = true;
 
-    const canSynthesize = 'speechSynthesis' in window;
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-    if (!canSynthesize || !SpeechRecognition) {
+    if (!SpeechRecognition) {
       setIsSpeechSupported(false);
       return;
     }
@@ -558,7 +542,6 @@ const CallPage = () => {
 
     return () => {
       recognition.stop();
-      window.speechSynthesis.cancel();
       stopVolumeMonitor();
       stopLocalStream();
       client.off('user-published', handleRemoteAudioPublished);
@@ -943,41 +926,13 @@ const CallPage = () => {
   const greetAndStart = () => {
     if (!callActive || hasGreetedRef.current) return;
     hasGreetedRef.current = true;
-    const firstItem = checklist[0];
-    if (!firstItem) return;
-    const intro = `Welcome to the checklist review. Let's begin with the first item. ${firstItem.question}`;
-
-    addConversationMessage('ai', intro);
-    speakText(intro, startListening);
-  };
-
-  const addConversationMessage = (sender, text) => {
-    setConversation((previous) => [...previous, { sender, text }]);
-  };
-
-  const speakText = (text, onComplete) => {
-    if (!('speechSynthesis' in window) || !callActive) {
-      onComplete?.();
-      return;
-    }
-
-    window.speechSynthesis.cancel();
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1;
-    utterance.pitch = 1;
-
-    setCallTone('speaking');
+    setCallTone('listening');
     setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
-
-    utterance.onend = () => {
-      if (!callActive) return;
-      setCallTone('listening');
-      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
-      onComplete?.();
-    };
-
-    window.speechSynthesis.speak(utterance);
+    setTimeout(() => {
+      if (callActive) {
+        startListening();
+      }
+    }, 200);
   };
 
   const startListening = () => {
@@ -1003,7 +958,6 @@ const CallPage = () => {
     if (!callActive) return;
 
     stopListening();
-    addConversationMessage('user', text);
 
     setIsProcessing(true);
     setCallTone('connected');
@@ -1012,10 +966,8 @@ const CallPage = () => {
     const currentItem = checklist[currentIndex];
     const nextItem = checklist[currentIndex + 1];
 
-    const { status, recommendation, aiResponse } = evaluateResponse({
-      userText: text,
-      item: currentItem,
-      nextItem
+    const { status, recommendation } = evaluateResponse({
+      userText: text
     });
 
     const updatedChecklist = checklist.map((item, index) =>
@@ -1031,32 +983,20 @@ const CallPage = () => {
 
     setIsProcessing(false);
 
-    addConversationMessage('ai', aiResponse);
-
     const nextIndex = currentIndex + 1;
     if (nextIndex < updatedChecklist.length) {
       setCurrentIndex(nextIndex);
-      speakText(aiResponse, () => {
-        const prompt = `Please confirm: ${updatedChecklist[nextIndex].question}`;
-        addConversationMessage('ai', prompt);
-        speakText(prompt, startListening);
-      });
+      setCallTone('listening');
+      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
+      setTimeout(() => {
+        if (callActive) {
+          startListening();
+        }
+      }, 400);
     } else {
       setCurrentIndex(nextIndex);
-      const completedCount = updatedChecklist.filter(
-        (item) => item.status === 'pass' || item.status === 'complete'
-      ).length;
-      const warningCount = updatedChecklist.filter((item) => item.status === 'warning').length;
-      const failCount = updatedChecklist.filter((item) => item.status === 'fail').length;
-
-      speakText(aiResponse, () => {
-        const summaryMessage = `Final summary: ${completedCount} completed, ${warningCount} warning, ${failCount} failed. Download the reviewed checklist whenever you are ready to wrap up.`;
-        addConversationMessage('ai', summaryMessage);
-        speakText(summaryMessage, () => {
-          setCallTone('connected');
-          setStatusLabel('Review complete');
-        });
-      });
+      setCallTone('connected');
+      setStatusLabel('Review complete');
     }
   };
 
@@ -1151,7 +1091,6 @@ const CallPage = () => {
   const handleEndCall = async () => {
     setCallActive(false);
     stopListening();
-    window.speechSynthesis.cancel();
     stopVolumeMonitor();
     stopLocalStream();
     await leaveAgoraVoiceCall();
@@ -1169,7 +1108,7 @@ const CallPage = () => {
       <div className="flex min-h-screen flex-col items-center justify-center bg-slate-925 px-6 text-center text-white">
         <h1 className="text-3xl font-bold">Voice Features Unavailable</h1>
         <p className="mt-4 max-w-xl text-base text-white/70">
-          Your browser does not fully support the Web Speech API features required for this
+          Your browser does not fully support the speech recognition features required for this
           experience. Please try again using the latest version of Chrome, Edge, or Safari.
         </p>
         <button
@@ -1192,7 +1131,6 @@ const CallPage = () => {
         </div>
         <div className="flex min-h-0 flex-col gap-6">
           <ConversationVisualizer tone={callTone} isConnected={agoraJoined} />
-          <TranscriptPanel conversation={conversation} />
         </div>
       </div>
       <CallControls
