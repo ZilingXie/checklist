@@ -67,33 +67,6 @@ const resolveChecklistApiBase = () => {
   return 'http://localhost:3100';
 };
 
-const evaluateResponse = ({ userText }) => {
-  const normalized = userText.toLowerCase();
-  let status = 'pass';
-
-  if (normalized.includes('not') || normalized.includes("n't") || normalized.includes('no')) {
-    status = 'fail';
-  } else if (
-    normalized.includes('pending') ||
-    normalized.includes('unsure') ||
-    normalized.includes('maybe') ||
-    normalized.includes('unknown')
-  ) {
-    status = 'warning';
-  }
-
-  const recommendations = {
-    pass: 'Great work. No further action required for this checklist item.',
-    warning: 'Please flag this item for follow-up and gather additional confirmation within 24 hours.',
-    fail: 'Immediate action required. Assign an owner to resolve the gap and document remediation steps.'
-  };
-
-  return {
-    status,
-    recommendation: recommendations[status]
-  };
-};
-
 const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
 const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
 const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN || null;
@@ -128,6 +101,8 @@ const CallPage = () => {
   const remoteAudioTracksRef = useRef(new Map());
   const agoraSessionContextRef = useRef(null);
   const hasResetChecklistRef = useRef(false);
+  const agentSpeakingRef = useRef(false);
+  const resumeListeningTimeoutRef = useRef(null);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('connecting');
   const [statusLabel, setStatusLabel] = useState('Connecting…');
@@ -451,14 +426,21 @@ const CallPage = () => {
     recognition.onerror = () => {
       if (callActive) {
         recognition.stop();
-        setTimeout(() => startListening(), 1000);
+        scheduleResumeListening(1000);
       }
     };
 
     recognition.onend = () => {
-      if (callActive && !isProcessing) {
-        setCallTone('listening');
-        setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
+      if (!callActive) return;
+      if (agentSpeakingRef.current) {
+        setCallTone('speaking');
+        setStatusLabel('Assistant speaking');
+        return;
+      }
+      setCallTone('connected');
+      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
+      if (resumeListeningTimeoutRef.current === null) {
+        scheduleResumeListening();
       }
     };
 
@@ -484,22 +466,63 @@ const CallPage = () => {
       try {
         await activeClient.subscribe(user, mediaType);
         const remoteAudioTrack = user.audioTrack;
-        remoteAudioTrack?.play();
-        remoteTracksForSession.set(user.uid, remoteAudioTrack);
+        if (!remoteAudioTrack) return;
+
+        const existingEntry = remoteTracksForSession.get(user.uid);
+        const existingTrack = existingEntry?.track;
+        if (existingTrack) {
+          if (typeof existingTrack.off === 'function' && existingEntry.onPlayerStateChange) {
+            existingTrack.off('player-state-change', existingEntry.onPlayerStateChange);
+          }
+          try {
+            existingTrack.stop();
+          } catch (error) {
+            console.error('Failed to stop previous remote Agora track', error);
+          }
+        }
+
+        const handlePlayerStateChange = (state) => {
+          if (state === 'playing') {
+            handleAgentSpeakingChange(true);
+          } else if (
+            state === 'stopped' ||
+            state === 'paused' ||
+            state === 'idle' ||
+            state === 'ended' ||
+            state === 'failed' ||
+            state === 'aborted'
+          ) {
+            handleAgentSpeakingChange(false);
+          }
+        };
+
+        remoteAudioTrack.on('player-state-change', handlePlayerStateChange);
+        remoteAudioTrack.play();
+        handleAgentSpeakingChange(true);
+        remoteTracksForSession.set(user.uid, {
+          track: remoteAudioTrack,
+          onPlayerStateChange: handlePlayerStateChange
+        });
       } catch (error) {
         console.error('Failed to subscribe to remote audio', error);
       }
     };
 
     const handleRemoteAudioRemoved = (user) => {
-      const remoteTrack = remoteTracksForSession.get(user.uid);
-      if (remoteTrack) {
+      const entry = remoteTracksForSession.get(user.uid);
+      if (entry?.track) {
+        if (typeof entry.track.off === 'function' && entry.onPlayerStateChange) {
+          entry.track.off('player-state-change', entry.onPlayerStateChange);
+        }
         try {
-          remoteTrack.stop();
+          entry.track.stop();
         } catch (error) {
           console.error('Failed to stop remote Agora track', error);
         }
-        remoteTracksForSession.delete(user.uid);
+      }
+      remoteTracksForSession.delete(user.uid);
+      if (remoteTracksForSession.size === 0) {
+        handleAgentSpeakingChange(false);
       }
     };
 
@@ -542,6 +565,7 @@ const CallPage = () => {
 
     return () => {
       recognition.stop();
+      clearResumeListeningTimeout();
       stopVolumeMonitor();
       stopLocalStream();
       client.off('user-published', handleRemoteAudioPublished);
@@ -644,7 +668,14 @@ const CallPage = () => {
       }
     }
 
-    tracks?.forEach((remoteTrack, uid) => {
+    tracks?.forEach((entry, uid) => {
+      const remoteTrack = entry?.track;
+      if (!remoteTrack) {
+        return;
+      }
+      if (typeof remoteTrack.off === 'function' && entry.onPlayerStateChange) {
+        remoteTrack.off('player-state-change', entry.onPlayerStateChange);
+      }
       try {
         remoteTrack.stop();
       } catch (error) {
@@ -655,6 +686,8 @@ const CallPage = () => {
     if (tracks && remoteAudioTracksRef.current === tracks) {
       remoteAudioTracksRef.current = new Map();
     }
+    agentSpeakingRef.current = false;
+    clearResumeListeningTimeout();
 
     if (client) {
       try {
@@ -920,19 +953,20 @@ const CallPage = () => {
 
     if (!success || !callActive) return;
     stopListening();
-    setTimeout(() => startListening(), 500);
+    scheduleResumeListening(500);
   };
 
   const greetAndStart = () => {
     if (!callActive || hasGreetedRef.current) return;
     hasGreetedRef.current = true;
+    if (agentSpeakingRef.current) {
+      setCallTone('speaking');
+      setStatusLabel('Assistant speaking');
+      return;
+    }
     setCallTone('listening');
     setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
-    setTimeout(() => {
-      if (callActive) {
-        startListening();
-      }
-    }, 200);
+    scheduleResumeListening(200);
   };
 
   const startListening = () => {
@@ -954,6 +988,49 @@ const CallPage = () => {
     recognition?.stop();
   };
 
+  const clearResumeListeningTimeout = () => {
+    if (resumeListeningTimeoutRef.current !== null) {
+      clearTimeout(resumeListeningTimeoutRef.current);
+      resumeListeningTimeoutRef.current = null;
+    }
+  };
+
+  const scheduleResumeListening = (delay = 400) => {
+    clearResumeListeningTimeout();
+    resumeListeningTimeoutRef.current = setTimeout(() => {
+      resumeListeningTimeoutRef.current = null;
+      if (!callActive || agentSpeakingRef.current) {
+        return;
+      }
+      startListening();
+    }, delay);
+  };
+
+  const handleAgentSpeakingChange = (isSpeaking) => {
+    if (agentSpeakingRef.current === isSpeaking) {
+      return;
+    }
+
+    agentSpeakingRef.current = isSpeaking;
+
+    if (!isComponentMountedRef.current) {
+      return;
+    }
+
+    if (isSpeaking) {
+      clearResumeListeningTimeout();
+      stopListening();
+      setCallTone('speaking');
+      setStatusLabel('Assistant speaking');
+    } else {
+      setCallTone('connected');
+      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
+      if (callActive) {
+        scheduleResumeListening();
+      }
+    }
+  };
+
   const handleUserSpeech = async (text) => {
     if (!callActive) return;
 
@@ -963,42 +1040,36 @@ const CallPage = () => {
     setCallTone('connected');
     setStatusLabel('Processing…');
 
-    const currentItem = checklist[currentIndex];
-    const nextItem = checklist[currentIndex + 1];
-
-    const { status, recommendation } = evaluateResponse({
-      userText: text
-    });
-
-    const updatedChecklist = checklist.map((item, index) =>
-      index === currentIndex
-        ? {
-            ...item,
-            status,
-            recommendation
-          }
-        : item
-    );
-    setChecklist(updatedChecklist);
+    const trimmed = typeof text === 'string' ? text.trim() : '';
+    if (trimmed) {
+      console.debug('Captured user response for agent evaluation:', trimmed);
+    }
 
     setIsProcessing(false);
 
-    const nextIndex = currentIndex + 1;
-    if (nextIndex < updatedChecklist.length) {
-      setCurrentIndex(nextIndex);
-      setCallTone('listening');
-      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
-      setTimeout(() => {
-        if (callActive) {
-          startListening();
-        }
-      }, 400);
-    } else {
-      setCurrentIndex(nextIndex);
-      setCallTone('connected');
-      setStatusLabel('Review complete');
+    if (!callActive) return;
+
+    if (agentSpeakingRef.current) {
+      setCallTone('speaking');
+      setStatusLabel('Assistant speaking');
+      return;
     }
+
+    setCallTone('connected');
+    setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
+    scheduleResumeListening();
   };
+
+  useEffect(() => {
+    if (!callActive || !isChecklistComplete) {
+      return;
+    }
+    recognitionRef.current?.stop();
+    clearResumeListeningTimeout();
+    agentSpeakingRef.current = false;
+    setCallTone('connected');
+    setStatusLabel('Review complete');
+  }, [callActive, isChecklistComplete]);
 
   const handleDownload = () => {
     const payload = {
@@ -1089,6 +1160,8 @@ const CallPage = () => {
   };
 
   const handleEndCall = async () => {
+    clearResumeListeningTimeout();
+    agentSpeakingRef.current = false;
     setCallActive(false);
     stopListening();
     stopVolumeMonitor();
