@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom';
 import AgoraRTC from 'agora-rtc-sdk-ng';
 import CallStatusBar from '../components/CallStatusBar.jsx';
 import ConversationVisualizer from '../components/ConversationVisualizer.jsx';
-import TranscriptPanel from '../components/TranscriptPanel.jsx';
 import ChecklistSidebar from '../components/ChecklistSidebar.jsx';
 import CallControls from '../components/CallControls.jsx';
 
@@ -68,46 +67,6 @@ const resolveChecklistApiBase = () => {
   return 'http://localhost:3100';
 };
 
-const evaluateResponse = ({ userText, item, nextItem }) => {
-  const normalized = userText.toLowerCase();
-  let status = 'pass';
-
-  if (normalized.includes('not') || normalized.includes("n't") || normalized.includes('no')) {
-    status = 'fail';
-  } else if (
-    normalized.includes('pending') ||
-    normalized.includes('unsure') ||
-    normalized.includes('maybe') ||
-    normalized.includes('unknown')
-  ) {
-    status = 'warning';
-  }
-
-  const recommendations = {
-    pass: 'Great work. No further action required for this checklist item.',
-    warning: 'Please flag this item for follow-up and gather additional confirmation within 24 hours.',
-    fail: 'Immediate action required. Assign an owner to resolve the gap and document remediation steps.'
-  };
-
-  const statusText =
-    status === 'pass' || status === 'complete'
-      ? 'marked as complete'
-      : status === 'fail'
-        ? 'marked as failed'
-        : 'set to warning';
-  const nextPrompt = nextItem ? `Next, ${nextItem.question}` : 'That completes our checklist.';
-
-  const aiResponse = `Thanks for the update. I have ${statusText} and noted: ${recommendations[status]} ${
-    nextItem ? nextPrompt : 'Here is a summary of our findings.'
-  }`;
-
-  return {
-    status,
-    recommendation: recommendations[status],
-    aiResponse
-  };
-};
-
 const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
 const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
 const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN || null;
@@ -142,10 +101,11 @@ const CallPage = () => {
   const remoteAudioTracksRef = useRef(new Map());
   const agoraSessionContextRef = useRef(null);
   const hasResetChecklistRef = useRef(false);
+  const agentSpeakingRef = useRef(false);
+  const resumeListeningTimeoutRef = useRef(null);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('connecting');
   const [statusLabel, setStatusLabel] = useState('Connecting…');
-  const [conversation, setConversation] = useState([]);
   const [checklist, setChecklist] = useState(initialChecklist);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [callActive, setCallActive] = useState(true);
@@ -443,10 +403,9 @@ const CallPage = () => {
   useEffect(() => {
     isComponentMountedRef.current = true;
 
-    const canSynthesize = 'speechSynthesis' in window;
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-    if (!canSynthesize || !SpeechRecognition) {
+    if (!SpeechRecognition) {
       setIsSpeechSupported(false);
       return;
     }
@@ -467,14 +426,21 @@ const CallPage = () => {
     recognition.onerror = () => {
       if (callActive) {
         recognition.stop();
-        setTimeout(() => startListening(), 1000);
+        scheduleResumeListening(1000);
       }
     };
 
     recognition.onend = () => {
-      if (callActive && !isProcessing) {
-        setCallTone('listening');
-        setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
+      if (!callActive) return;
+      if (agentSpeakingRef.current) {
+        setCallTone('speaking');
+        setStatusLabel('Assistant speaking');
+        return;
+      }
+      setCallTone('connected');
+      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
+      if (resumeListeningTimeoutRef.current === null) {
+        scheduleResumeListening();
       }
     };
 
@@ -500,22 +466,63 @@ const CallPage = () => {
       try {
         await activeClient.subscribe(user, mediaType);
         const remoteAudioTrack = user.audioTrack;
-        remoteAudioTrack?.play();
-        remoteTracksForSession.set(user.uid, remoteAudioTrack);
+        if (!remoteAudioTrack) return;
+
+        const existingEntry = remoteTracksForSession.get(user.uid);
+        const existingTrack = existingEntry?.track;
+        if (existingTrack) {
+          if (typeof existingTrack.off === 'function' && existingEntry.onPlayerStateChange) {
+            existingTrack.off('player-state-change', existingEntry.onPlayerStateChange);
+          }
+          try {
+            existingTrack.stop();
+          } catch (error) {
+            console.error('Failed to stop previous remote Agora track', error);
+          }
+        }
+
+        const handlePlayerStateChange = (state) => {
+          if (state === 'playing') {
+            handleAgentSpeakingChange(true);
+          } else if (
+            state === 'stopped' ||
+            state === 'paused' ||
+            state === 'idle' ||
+            state === 'ended' ||
+            state === 'failed' ||
+            state === 'aborted'
+          ) {
+            handleAgentSpeakingChange(false);
+          }
+        };
+
+        remoteAudioTrack.on('player-state-change', handlePlayerStateChange);
+        remoteAudioTrack.play();
+        handleAgentSpeakingChange(true);
+        remoteTracksForSession.set(user.uid, {
+          track: remoteAudioTrack,
+          onPlayerStateChange: handlePlayerStateChange
+        });
       } catch (error) {
         console.error('Failed to subscribe to remote audio', error);
       }
     };
 
     const handleRemoteAudioRemoved = (user) => {
-      const remoteTrack = remoteTracksForSession.get(user.uid);
-      if (remoteTrack) {
+      const entry = remoteTracksForSession.get(user.uid);
+      if (entry?.track) {
+        if (typeof entry.track.off === 'function' && entry.onPlayerStateChange) {
+          entry.track.off('player-state-change', entry.onPlayerStateChange);
+        }
         try {
-          remoteTrack.stop();
+          entry.track.stop();
         } catch (error) {
           console.error('Failed to stop remote Agora track', error);
         }
-        remoteTracksForSession.delete(user.uid);
+      }
+      remoteTracksForSession.delete(user.uid);
+      if (remoteTracksForSession.size === 0) {
+        handleAgentSpeakingChange(false);
       }
     };
 
@@ -558,7 +565,7 @@ const CallPage = () => {
 
     return () => {
       recognition.stop();
-      window.speechSynthesis.cancel();
+      clearResumeListeningTimeout();
       stopVolumeMonitor();
       stopLocalStream();
       client.off('user-published', handleRemoteAudioPublished);
@@ -661,7 +668,14 @@ const CallPage = () => {
       }
     }
 
-    tracks?.forEach((remoteTrack, uid) => {
+    tracks?.forEach((entry, uid) => {
+      const remoteTrack = entry?.track;
+      if (!remoteTrack) {
+        return;
+      }
+      if (typeof remoteTrack.off === 'function' && entry.onPlayerStateChange) {
+        remoteTrack.off('player-state-change', entry.onPlayerStateChange);
+      }
       try {
         remoteTrack.stop();
       } catch (error) {
@@ -672,6 +686,8 @@ const CallPage = () => {
     if (tracks && remoteAudioTracksRef.current === tracks) {
       remoteAudioTracksRef.current = new Map();
     }
+    agentSpeakingRef.current = false;
+    clearResumeListeningTimeout();
 
     if (client) {
       try {
@@ -937,47 +953,20 @@ const CallPage = () => {
 
     if (!success || !callActive) return;
     stopListening();
-    setTimeout(() => startListening(), 500);
+    scheduleResumeListening(500);
   };
 
   const greetAndStart = () => {
     if (!callActive || hasGreetedRef.current) return;
     hasGreetedRef.current = true;
-    const firstItem = checklist[0];
-    if (!firstItem) return;
-    const intro = `Welcome to the checklist review. Let's begin with the first item. ${firstItem.question}`;
-
-    addConversationMessage('ai', intro);
-    speakText(intro, startListening);
-  };
-
-  const addConversationMessage = (sender, text) => {
-    setConversation((previous) => [...previous, { sender, text }]);
-  };
-
-  const speakText = (text, onComplete) => {
-    if (!('speechSynthesis' in window) || !callActive) {
-      onComplete?.();
+    if (agentSpeakingRef.current) {
+      setCallTone('speaking');
+      setStatusLabel('Assistant speaking');
       return;
     }
-
-    window.speechSynthesis.cancel();
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1;
-    utterance.pitch = 1;
-
-    setCallTone('speaking');
+    setCallTone('listening');
     setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
-
-    utterance.onend = () => {
-      if (!callActive) return;
-      setCallTone('listening');
-      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
-      onComplete?.();
-    };
-
-    window.speechSynthesis.speak(utterance);
+    scheduleResumeListening(200);
   };
 
   const startListening = () => {
@@ -999,66 +988,88 @@ const CallPage = () => {
     recognition?.stop();
   };
 
+  const clearResumeListeningTimeout = () => {
+    if (resumeListeningTimeoutRef.current !== null) {
+      clearTimeout(resumeListeningTimeoutRef.current);
+      resumeListeningTimeoutRef.current = null;
+    }
+  };
+
+  const scheduleResumeListening = (delay = 400) => {
+    clearResumeListeningTimeout();
+    resumeListeningTimeoutRef.current = setTimeout(() => {
+      resumeListeningTimeoutRef.current = null;
+      if (!callActive || agentSpeakingRef.current) {
+        return;
+      }
+      startListening();
+    }, delay);
+  };
+
+  const handleAgentSpeakingChange = (isSpeaking) => {
+    if (agentSpeakingRef.current === isSpeaking) {
+      return;
+    }
+
+    agentSpeakingRef.current = isSpeaking;
+
+    if (!isComponentMountedRef.current) {
+      return;
+    }
+
+    if (isSpeaking) {
+      clearResumeListeningTimeout();
+      stopListening();
+      setCallTone('speaking');
+      setStatusLabel('Assistant speaking');
+    } else {
+      setCallTone('connected');
+      setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
+      if (callActive) {
+        scheduleResumeListening();
+      }
+    }
+  };
+
   const handleUserSpeech = async (text) => {
     if (!callActive) return;
 
     stopListening();
-    addConversationMessage('user', text);
 
     setIsProcessing(true);
     setCallTone('connected');
     setStatusLabel('Processing…');
 
-    const currentItem = checklist[currentIndex];
-    const nextItem = checklist[currentIndex + 1];
-
-    const { status, recommendation, aiResponse } = evaluateResponse({
-      userText: text,
-      item: currentItem,
-      nextItem
-    });
-
-    const updatedChecklist = checklist.map((item, index) =>
-      index === currentIndex
-        ? {
-            ...item,
-            status,
-            recommendation
-          }
-        : item
-    );
-    setChecklist(updatedChecklist);
+    const trimmed = typeof text === 'string' ? text.trim() : '';
+    if (trimmed) {
+      console.debug('Captured user response for agent evaluation:', trimmed);
+    }
 
     setIsProcessing(false);
 
-    addConversationMessage('ai', aiResponse);
+    if (!callActive) return;
 
-    const nextIndex = currentIndex + 1;
-    if (nextIndex < updatedChecklist.length) {
-      setCurrentIndex(nextIndex);
-      speakText(aiResponse, () => {
-        const prompt = `Please confirm: ${updatedChecklist[nextIndex].question}`;
-        addConversationMessage('ai', prompt);
-        speakText(prompt, startListening);
-      });
-    } else {
-      setCurrentIndex(nextIndex);
-      const completedCount = updatedChecklist.filter(
-        (item) => item.status === 'pass' || item.status === 'complete'
-      ).length;
-      const warningCount = updatedChecklist.filter((item) => item.status === 'warning').length;
-      const failCount = updatedChecklist.filter((item) => item.status === 'fail').length;
-
-      speakText(aiResponse, () => {
-        const summaryMessage = `Final summary: ${completedCount} completed, ${warningCount} warning, ${failCount} failed. Download the reviewed checklist whenever you are ready to wrap up.`;
-        addConversationMessage('ai', summaryMessage);
-        speakText(summaryMessage, () => {
-          setCallTone('connected');
-          setStatusLabel('Review complete');
-        });
-      });
+    if (agentSpeakingRef.current) {
+      setCallTone('speaking');
+      setStatusLabel('Assistant speaking');
+      return;
     }
+
+    setCallTone('connected');
+    setStatusLabel((previous) => (previous === 'Connecting…' ? previous : 'Connected'));
+    scheduleResumeListening();
   };
+
+  useEffect(() => {
+    if (!callActive || !isChecklistComplete) {
+      return;
+    }
+    recognitionRef.current?.stop();
+    clearResumeListeningTimeout();
+    agentSpeakingRef.current = false;
+    setCallTone('connected');
+    setStatusLabel('Review complete');
+  }, [callActive, isChecklistComplete]);
 
   const handleDownload = () => {
     const payload = {
@@ -1149,9 +1160,10 @@ const CallPage = () => {
   };
 
   const handleEndCall = async () => {
+    clearResumeListeningTimeout();
+    agentSpeakingRef.current = false;
     setCallActive(false);
     stopListening();
-    window.speechSynthesis.cancel();
     stopVolumeMonitor();
     stopLocalStream();
     await leaveAgoraVoiceCall();
@@ -1169,7 +1181,7 @@ const CallPage = () => {
       <div className="flex min-h-screen flex-col items-center justify-center bg-slate-925 px-6 text-center text-white">
         <h1 className="text-3xl font-bold">Voice Features Unavailable</h1>
         <p className="mt-4 max-w-xl text-base text-white/70">
-          Your browser does not fully support the Web Speech API features required for this
+          Your browser does not fully support the speech recognition features required for this
           experience. Please try again using the latest version of Chrome, Edge, or Safari.
         </p>
         <button
@@ -1192,7 +1204,6 @@ const CallPage = () => {
         </div>
         <div className="flex min-h-0 flex-col gap-6">
           <ConversationVisualizer tone={callTone} isConnected={agoraJoined} />
-          <TranscriptPanel conversation={conversation} />
         </div>
       </div>
       <CallControls
