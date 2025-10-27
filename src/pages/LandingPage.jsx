@@ -240,14 +240,14 @@ const LandingPage = () => {
 
       <main className="relative mx-auto flex min-h-screen max-w-6xl flex-col items-center justify-center px-6 text-center">
         <span className="mb-6 rounded-full bg-white/10 px-4 py-1 text-sm font-medium uppercase tracking-[0.3em] text-white/80">
-          Smart Compliance
+          Agora Health Check
         </span>
         <h1 className="text-4xl font-bold leading-tight sm:text-5xl lg:text-6xl">
-          AI-Powered Checklist Review
+          Agora Best-Practice Assessment
         </h1>
         <p className="mt-6 max-w-2xl text-lg text-white/80 sm:text-xl">
-          Experience the future of compliance. Conduct your checklist reviews through a natural,
-          voice-driven conversation with an AI assistant that evaluates and updates in real time.
+          Run a guided health check to confirm your Agora implementation follows best practices and
+          delivers a reliable real-time experience for your customers.
         </p>
         <div className="mt-10 flex gap-4">
           <Link
@@ -277,31 +277,31 @@ const LandingPage = () => {
         <h2 className="text-2xl font-semibold text-white">What to Expect</h2>
         <dl className="mt-6 grid gap-6 text-left sm:grid-cols-2">
           <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
-            <dt className="text-lg font-semibold text-white">Conversational AI Guidance</dt>
+            <dt className="text-lg font-semibold text-white">Guided Best-Practice Review</dt>
             <dd className="mt-2 text-sm text-white/70">
-              The assistant walks through each checklist item, captures responses, and evaluates them
-              instantly.
+              An Agora-focused assistant walks through critical usage patterns to confirm your
+              deployment meets recommended standards.
             </dd>
           </div>
           <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
-            <dt className="text-lg font-semibold text-white">Real-Time Insights</dt>
+            <dt className="text-lg font-semibold text-white">Real-Time Compliance Pulse</dt>
             <dd className="mt-2 text-sm text-white/70">
-              Watch the checklist update live with pass, fail, and warning indicators plus tailored
-              recommendations.
+              Instantly see pass, warning, and remediation cues as we benchmark your setup against
+              Agora health criteria.
             </dd>
           </div>
           <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
-            <dt className="text-lg font-semibold text-white">Voice-First Workflow</dt>
+            <dt className="text-lg font-semibold text-white">Voice-Driven Assessment</dt>
             <dd className="mt-2 text-sm text-white/70">
-              Speak naturally while the app transcribes, analyzes, and responds using the Web Speech
-              API.
+              Describe your environment in natural language while the assistant transcribes and
+              cross-checks configurations.
             </dd>
           </div>
           <div className="rounded-2xl border border-white/10 bg-white/5 p-6">
-            <dt className="text-lg font-semibold text-white">Export Ready</dt>
+            <dt className="text-lg font-semibold text-white">Instant Optimization Report</dt>
             <dd className="mt-2 text-sm text-white/70">
-              Download a completed checklist the moment your review wraps up, with every insight in
-              place.
+              Export a health-check summary capturing prioritized fixes and next steps tailored to
+              your Agora workloads.
             </dd>
           </div>
         </dl>

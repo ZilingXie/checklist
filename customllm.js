@@ -9,21 +9,21 @@ const MAX_BODY_SIZE = 1_000_000;
 const checklistDefaults = [
   {
     id: 'item-1',
-    question: 'Verify emergency exits remain unobstructed and clearly marked.',
+    question: 'Mixed usage of string and integer UIDs.',
     status: 'pending',
     recommendation: '',
     updatedAt: new Date().toISOString()
   },
   {
     id: 'item-2',
-    question: 'Confirm all fire extinguishers are inspected and tagged within the last 30 days.',
+    question: 'Enabled token and deploy a token server.',
     status: 'pending',
     recommendation: '',
     updatedAt: new Date().toISOString()
   },
   {
     id: 'item-3',
-    question: 'Ensure incident response documentation is up to date and accessible to staff.',
+    question: 'Initialize Agora engine before join the channel.',
     status: 'pending',
     recommendation: '',
     updatedAt: new Date().toISOString()
@@ -101,7 +101,6 @@ const loadDotEnvFile = (fileName) => {
 };
 
 loadDotEnvFile('.env');
-loadDotEnvFile('.env.local');
 
 const PORT = Number.parseInt(env.CUSTOM_LLM_PORT ?? '3100', 10);
 const HOST = env.CUSTOM_LLM_HOST ?? '0.0.0.0';

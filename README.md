@@ -36,17 +36,17 @@ npm run preview
 ## Agora Voice Setup
 
 - The call page now connects to Agora for audio-only meetings when you click “Join Call”.
-- Add your Agora credentials to `.env.local` (values must be prefixed with `VITE_` for Vite):
+- Add your Agora credentials to `.env` (values exposed to the client must still be prefixed with `VITE_` for Vite):
   - `VITE_AGORA_APP_ID`
   - `VITE_AGORA_CHANNEL`
   - `VITE_AGORA_TEMP_TOKEN` (leave blank when using an app certificate-less project)
   - `VITE_AGORA_UID` (optional numeric UID; Agora will auto-assign if omitted)
-- Restart the dev server after updating `.env.local` so Vite picks up the new variables.
+- Restart the dev server after updating `.env` so Vite picks up the new variables.
 
 ## Conversational AI Agent Join
 
 - Clicking “Join Call” now sends a POST request to the agent controller service (`server.js`), which forwards the payload to Agora’s Conversational AI Agent join API.
-- Point `VITE_AGENT_CONTROLLER_URL` (or `VITE_AI_AGENT_SERVER_URL`) in `.env.local` to the base URL of your deployed controller; the client will call `${baseUrl}/agent/join`.
+- Point `VITE_AGENT_CONTROLLER_URL` (or `VITE_AI_AGENT_SERVER_URL`) in `.env` to the base URL of your deployed controller; the client will call `${baseUrl}/agent/join`.
 - Protect the controller by setting a shared bearer token: define `AGENT_CONTROLLER_AUTH_TOKEN` for the Node server (for example in `.env`) and the matching `VITE_AGENT_CONTROLLER_AUTH_TOKEN` for the Vite app. All `/agent/join` and `/agent/leave` requests now require `Authorization: Bearer <token>`.
 - Run the controller locally with `node server.js` (default host `0.0.0.0:3000`) and deploy it to AWS EC2 for production. Configure optional `PORT`, `HOST`, or `ALLOWED_ORIGINS` environment variables to fit your hosting environment.
 - The controller will automatically read a `.env` file from its working directory—store your `AGORA_*` secrets there when running on EC2 instead of exporting them manually.
