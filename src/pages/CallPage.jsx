@@ -9,19 +9,19 @@ import CallControls from '../components/CallControls.jsx';
 const initialChecklist = [
   {
     id: 'item-1',
-    question: 'Verify emergency exits remain unobstructed and clearly marked.',
+    question: 'Mixed usage of string and integer UIDs.',
     status: 'pending',
     recommendation: ''
   },
   {
     id: 'item-2',
-    question: 'Confirm all fire extinguishers are inspected and tagged within the last 30 days.',
+    question: 'Enabled token and deploy a token server.',
     status: 'pending',
     recommendation: ''
   },
   {
     id: 'item-3',
-    question: 'Ensure incident response documentation is up to date and accessible to staff.',
+    question: 'Initialize Agora engine before join the channel.',
     status: 'pending',
     recommendation: ''
   }
@@ -82,6 +82,24 @@ const AGENT_CONTROLLER_AUTH_TOKEN =
   import.meta.env.VITE_AGENT_CONTROLLER_AUTH_TOKEN ??
   import.meta.env.VITE_AGENT_CONTROLLER_AUTH_SECRET ??
   '';
+
+const checklistDefinitionsById = initialChecklist.reduce((acc, item) => {
+  acc[item.id] = item;
+  return acc;
+}, {});
+
+const normalizeChecklistItems = (items) =>
+  items.map((item, index) => {
+    const fallbackDefinition = initialChecklist[index];
+    const definition = checklistDefinitionsById[item.id] ?? fallbackDefinition;
+    const question = definition?.question ?? item.question;
+
+    return {
+      ...definition,
+      ...item,
+      question
+    };
+  });
 
 const CallPage = () => {
   const navigate = useNavigate();
@@ -223,7 +241,7 @@ const CallPage = () => {
         return;
       }
 
-      setChecklist(snapshot.items);
+      setChecklist(normalizeChecklistItems(snapshot.items));
 
       const nextPendingIndex = snapshot.items.findIndex((item) => item.status === 'pending');
       setCurrentIndex(nextPendingIndex === -1 ? snapshot.items.length : nextPendingIndex);
