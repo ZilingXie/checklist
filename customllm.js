@@ -33,6 +33,122 @@ const checklistDefaults = [
 let checklistItems = checklistDefaults.map((item) => ({ ...item }));
 const checklistStreams = new Set();
 
+const sessionMemories = new Map();
+const DEFAULT_SESSION_ID = 'default-session';
+
+const createChecklistStatusMap = () =>
+  new Map(checklistDefaults.map((item) => [item.id, 'pending']));
+
+const ensureSessionMemory = (sessionId = DEFAULT_SESSION_ID) => {
+  const key =
+    typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : DEFAULT_SESSION_ID;
+
+  let memory = sessionMemories.get(key);
+  if (memory) {
+    return memory;
+  }
+
+  memory = {
+    sessionId: key,
+    contents: [],
+    seenKeys: new Set(),
+    statuses: createChecklistStatusMap(),
+    recommendations: new Map(),
+    lastAskedItemId: null,
+    nextTurnId: 0,
+    lastUpdatedAt: Date.now()
+  };
+  sessionMemories.set(key, memory);
+  return memory;
+};
+
+const clearSessionMemory = (sessionId) => {
+  if (!sessionId) return;
+  sessionMemories.delete(sessionId);
+};
+
+const clearAllSessionMemories = () => {
+  sessionMemories.clear();
+};
+
+const safeJsonParse = (value) => {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+};
+
+const normalizeMessageContentText = (content) => {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part.text === 'string') return part.text;
+        return '';
+      })
+      .filter(Boolean)
+      .join(' ');
+  }
+  if (content && typeof content === 'object' && typeof content.text === 'string') {
+    return content.text;
+  }
+  return '';
+};
+
+const extractSessionId = (body) => {
+  const candidates = [
+    body?.context?.session_id,
+    body?.context?.sessionId,
+    body?.context?.channel,
+    body?.context?.channel_name,
+    body?.context?.connection_id,
+    body?.context?.call_id,
+    body?.context?.agent_session_id,
+    body?.session_id,
+    body?.sessionId,
+    body?.channel,
+    body?.agent_id
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  if (Array.isArray(body?.messages)) {
+    for (const message of body.messages) {
+      const metadata = message?.metadata ?? {};
+      const messageCandidates = [
+        metadata.session_id,
+        metadata.sessionId,
+        metadata.channel,
+        metadata.user,
+        metadata.conversation_id,
+        message?.turn_id
+      ];
+      for (const candidate of messageCandidates) {
+        if (candidate === undefined || candidate === null) continue;
+        const value = String(candidate).trim();
+        if (value) {
+          return value;
+        }
+      }
+    }
+  }
+
+  return DEFAULT_SESSION_ID;
+};
+
 const getChecklistSnapshot = () => ({
   updatedAt: new Date().toISOString(),
   items: checklistItems.map((item) => ({ ...item }))
@@ -56,6 +172,7 @@ const broadcastChecklistUpdate = () => {
 };
 
 const resetChecklist = () => {
+  clearAllSessionMemories();
   checklistItems = checklistDefaults.map((item) => ({
     ...item,
     status: 'pending',
@@ -101,6 +218,27 @@ const loadDotEnvFile = (fileName) => {
 };
 
 loadDotEnvFile('.env');
+
+const pickFirstNonEmptyString = (...candidates) => {
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return undefined;
+};
+
+const fallbackAssistantGreeting =
+  'Hi, I\'m Aiden, your Agora checklist assistant. To kick things off, are you seeing any mixed usage of string and integer RTC UIDs in your implementation?';
+
+const configuredAssistantGreeting = pickFirstNonEmptyString(
+  env.CUSTOM_LLM_GREETING_MESSAGE,
+  env.AGORA_AGENT_GREETING_MESSAGE,
+  env.VITE_AGORA_AGENT_GREETING_MESSAGE,
+  fallbackAssistantGreeting
+);
 
 const PORT = Number.parseInt(env.CUSTOM_LLM_PORT ?? '3100', 10);
 const HOST = env.CUSTOM_LLM_HOST ?? '0.0.0.0';
@@ -349,6 +487,261 @@ const findChecklistItem = ({ itemId, itemNumber, itemName }) => {
   }
 
   return undefined;
+};
+
+const addMessageToSessionMemory = (memory, message) => {
+  if (!memory || !message) return;
+  if (message.role === 'system') return;
+
+  const metadata =
+    message.metadata && typeof message.metadata === 'object' ? message.metadata : undefined;
+
+  let key;
+  if (metadata && typeof metadata.message_id === 'string' && metadata.message_id.trim()) {
+    key = `id:${metadata.message_id.trim()}`;
+  } else if (metadata && typeof metadata.id === 'string' && metadata.id.trim()) {
+    key = `id:${metadata.id.trim()}`;
+  } else if (Number.isFinite(message.turn_id)) {
+    key = `turn:${message.turn_id}:${message.role ?? 'unknown'}`;
+  } else {
+    const text = normalizeMessageContentText(message.content);
+    key = `text:${message.role ?? 'unknown'}:${text.slice(0, 80)}`;
+  }
+
+  if (memory.seenKeys.has(key)) {
+    return;
+  }
+  memory.seenKeys.add(key);
+
+  const assignedTurnId =
+    Number.isFinite(message.turn_id) && message.turn_id >= 0
+      ? message.turn_id
+      : memory.nextTurnId++;
+
+  const entry = {
+    role: message.role ?? 'assistant',
+    content: message.content ?? '',
+    turn_id: assignedTurnId,
+    timestamp:
+      Number.isFinite(message.timestamp) || typeof message.timestamp === 'string'
+        ? message.timestamp
+        : Date.now(),
+    metadata
+  };
+
+  memory.contents.push(entry);
+  memory.lastUpdatedAt = Date.now();
+  if (assignedTurnId >= memory.nextTurnId) {
+    memory.nextTurnId = assignedTurnId + 1;
+  }
+};
+
+const updateSessionMemoryFromMessages = (memory, messages) => {
+  if (!memory || !Array.isArray(messages)) return;
+
+  for (const message of messages) {
+    if (!message) continue;
+    addMessageToSessionMemory(memory, message);
+
+    if (message.role === 'tool' && typeof message.content === 'string') {
+      const payload = safeJsonParse(message.content);
+      const itemId = payload?.item?.id;
+      if (itemId) {
+        const normalizedStatus = normalizeChecklistStatus(
+          payload.item.status ?? payload.newStatus ?? payload.status
+        );
+        if (normalizedStatus) {
+          memory.statuses.set(itemId, normalizedStatus);
+        }
+        if (typeof payload.item.recommendation === 'string') {
+          const trimmed = payload.item.recommendation.trim();
+          if (trimmed) {
+            memory.recommendations.set(itemId, trimmed);
+          } else {
+            memory.recommendations.delete(itemId);
+          }
+        }
+      }
+    }
+  }
+};
+
+const syncSessionMemoryFromChecklist = (memory) => {
+  if (!memory) return;
+  for (const item of checklistItems) {
+    const normalizedStatus = normalizeChecklistStatus(item.status) ?? 'pending';
+    memory.statuses.set(item.id, normalizedStatus);
+
+    if (typeof item.recommendation === 'string' && item.recommendation.trim()) {
+      memory.recommendations.set(item.id, item.recommendation.trim());
+    } else {
+      memory.recommendations.delete(item.id);
+    }
+  }
+};
+
+const parseToolCallArguments = (call) => {
+  if (!call?.function?.arguments) {
+    return {};
+  }
+  return safeJsonParse(call.function.arguments) ?? {};
+};
+
+const applyToolCallToSessionMemory = (memory, call, result) => {
+  if (!memory || !call?.function?.name) {
+    return;
+  }
+
+  const functionName = call.function.name;
+  if (functionName === 'update_checklist_item_status') {
+    const args = parseToolCallArguments(call) ?? {};
+    const target =
+      findChecklistItem({
+        itemId: args.item_id ?? result?.item?.id ?? result?.item_id,
+        itemNumber: args.item_number,
+        itemName: args.item_name
+      }) ?? (result?.item?.id ? { id: result.item.id } : null);
+
+    const statusCandidate =
+      args.status ?? result?.newStatus ?? result?.item?.status ?? result?.status;
+    const normalizedStatus = normalizeChecklistStatus(statusCandidate);
+
+    if (target && normalizedStatus) {
+      memory.statuses.set(target.id, normalizedStatus);
+
+      const recommendationCandidate =
+        typeof args.recommendation === 'string'
+          ? args.recommendation
+          : typeof args.note === 'string'
+            ? args.note
+            : typeof result?.item?.recommendation === 'string'
+              ? result.item.recommendation
+              : undefined;
+
+      if (recommendationCandidate !== undefined) {
+        const trimmed = String(recommendationCandidate).trim();
+        if (trimmed) {
+          memory.recommendations.set(target.id, trimmed);
+        } else {
+          memory.recommendations.delete(target.id);
+        }
+      }
+
+      memory.lastAskedItemId = target.id;
+    }
+  } else if (functionName === 'reset_checklist') {
+    memory.statuses = createChecklistStatusMap();
+    memory.recommendations.clear();
+    memory.lastAskedItemId = null;
+  }
+
+  memory.lastUpdatedAt = Date.now();
+  syncSessionMemoryFromChecklist(memory);
+};
+
+const SESSION_MEMORY_MARKER = '[SessionMemory]';
+
+const buildSessionMemorySummary = (memory) => {
+  if (!memory) return '';
+
+  const items = checklistDefaults.map((item, index) => {
+    const status = memory.statuses.get(item.id) ?? 'pending';
+    const recommendation = memory.recommendations.get(item.id) ?? '';
+    return {
+      id: item.id,
+      question: item.question,
+      index,
+      status,
+      recommendation
+    };
+  });
+
+  const nextPending = items.find((item) => item.status === 'pending');
+
+  const lines = items.map((item) => {
+    const base = `${item.index + 1}. ${item.question} -> ${item.status}`;
+    if (item.recommendation) {
+      return `${base} (recommendation: ${item.recommendation})`;
+    }
+    return base;
+  });
+
+  const focusLine = nextPending
+    ? `Next pending item: #${nextPending.index + 1} "${nextPending.question}". Ask about this next.`
+    : 'Next pending item: none. The checklist is complete—wrap up the session.';
+
+  return `${lines.join('\n')}\n${focusLine}`;
+};
+
+const injectSessionMemoryMessage = (messages, summary) => {
+  if (!summary || !Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  const summaryText = `${SESSION_MEMORY_MARKER}\n${summary}`;
+  const existingIndex = messages.findIndex(
+    (message) =>
+      message &&
+      message.role === 'system' &&
+      typeof message.content === 'string' &&
+      message.content.includes(SESSION_MEMORY_MARKER)
+  );
+
+  if (existingIndex !== -1) {
+    messages[existingIndex] = { role: 'system', content: summaryText };
+    return messages;
+  }
+
+  const firstSystemIndex = messages.findIndex((message) => message?.role === 'system');
+  const summaryMessage = { role: 'system', content: summaryText };
+
+  if (firstSystemIndex !== -1) {
+    messages.splice(firstSystemIndex + 1, 0, summaryMessage);
+  } else {
+    messages.unshift(summaryMessage);
+  }
+
+  return messages;
+};
+
+const ensureAssistantGreetingPresence = (messages, sessionMemory) => {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  const hasAssistantMessage = messages.some((message) => message?.role === 'assistant');
+  const memoryHasAssistant =
+    Array.isArray(sessionMemory?.contents) &&
+    sessionMemory.contents.some((entry) => entry?.role === 'assistant');
+
+  if (hasAssistantMessage || memoryHasAssistant) {
+    return messages;
+  }
+
+  if (!configuredAssistantGreeting) {
+    return messages;
+  }
+
+  const syntheticGreeting = {
+    role: 'assistant',
+    content: configuredAssistantGreeting
+  };
+
+  const result = [...messages];
+  let lastSystemIndex = -1;
+  for (let index = 0; index < result.length; index += 1) {
+    if (result[index]?.role === 'system') {
+      lastSystemIndex = index;
+    }
+  }
+
+  if (lastSystemIndex >= 0) {
+    result.splice(lastSystemIndex + 1, 0, syntheticGreeting);
+  } else {
+    result.unshift(syntheticGreeting);
+  }
+
+  return result;
 };
 
 registerTool('update_checklist_item_status', {
@@ -947,8 +1340,18 @@ const mergeToolDefinitions = (providedTools, registeredTools) => {
   return merged;
 };
 
-const defaultChecklistInstruction =
-  'You manage a shared compliance checklist. When the user confirms progress on an item, call the function `update_checklist_item_status` with either the item number (1-based) or id (e.g., "item-1") and set `status` to "complete" (or another appropriate value). Summarize any changes back to the user after the function call.';
+const checklistSequenceDescription = checklistDefaults
+  .map((item, index) => `${index + 1}) ${item.question}`)
+  .join('\n   ');
+
+const defaultChecklistInstruction = `You are "Aiden", the Agora deployment checklist assistant. Follow these rules:
+1. Greet the user with a single sentence introduction that states your name and role. In the same turn, immediately ask about checklist item #1 as a clear yes/no question.
+2. Review the checklist strictly in order:
+   ${checklistSequenceDescription}
+3. Ask about one item at a time and wait for the user's answer before proceeding. Do not skip or merge items.
+4. After each answer, decide whether the item passes or fails. Call update_checklist_item_status with status "complete" for a pass or "fail" when issues remain, and include a short actionable suggestion in the recommendation field.
+5. Confirm the decision to the user (explicitly say pass or fail) before you move on. Once every item is complete, wrap up the review and offer additional help if needed.
+Use the provided session memory summary to remember progress and avoid repeating questions.`;
 
 const ensureChecklistToolInstruction = (messages) => {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -1105,12 +1508,21 @@ const handleChatCompletion = async (req, res, origin) => {
     return;
   }
 
+  const sessionId = extractSessionId(body);
+  const sessionMemory = ensureSessionMemory(sessionId);
+  messages = ensureAssistantGreetingPresence(messages, sessionMemory);
+  updateSessionMemoryFromMessages(sessionMemory, messages);
+  syncSessionMemoryFromChecklist(sessionMemory);
+
   const registeredToolDefinitions = getRegisteredToolDefinitions();
   const combinedTools = mergeToolDefinitions(body.tools, registeredToolDefinitions);
   const resolvedToolChoice =
     body.tool_choice === undefined && combinedTools.length > 0 ? 'auto' : body.tool_choice;
 
   messages = ensureChecklistToolInstruction(messages);
+
+  const memorySummary = buildSessionMemorySummary(sessionMemory);
+  messages = injectSessionMemoryMessage(messages, memorySummary);
 
   const responseHeaders = {
     ...buildCorsHeaders(origin),
@@ -1207,14 +1619,19 @@ const handleChatCompletion = async (req, res, origin) => {
       if (toolCalls.length > 0) {
         sendToolCallChunk(res, model, toolCalls);
 
-        messages.push({
+        const assistantToolMessage = {
           role: 'assistant',
           content: assistantMessage.content ?? null,
           tool_calls: toolCalls
-        });
+        };
+
+        messages.push(assistantToolMessage);
+        addMessageToSessionMemory(sessionMemory, assistantToolMessage);
 
         for (const call of toolCalls) {
           const toolResult = await executeToolCall(call);
+          applyToolCallToSessionMemory(sessionMemory, call, toolResult);
+
           const toolMessage = {
             role: 'tool',
             tool_call_id: call.id ?? call.function?.name ?? 'tool',
@@ -1222,8 +1639,14 @@ const handleChatCompletion = async (req, res, origin) => {
           };
 
           messages.push(toolMessage);
+          addMessageToSessionMemory(sessionMemory, toolMessage);
         }
 
+        syncSessionMemoryFromChecklist(sessionMemory);
+        messages = injectSessionMemoryMessage(
+          messages,
+          buildSessionMemorySummary(sessionMemory)
+        );
         continue;
       }
 
@@ -1236,6 +1659,13 @@ const handleChatCompletion = async (req, res, origin) => {
         audioChunk.choices[0].delta.audio = assistantMessage.audio;
         sendSseChunk(res, audioChunk);
       }
+
+      addMessageToSessionMemory(sessionMemory, {
+        role: 'assistant',
+        content: assistantMessage.content ?? '',
+        audio: assistantMessage.audio ?? undefined
+      });
+      syncSessionMemoryFromChecklist(sessionMemory);
 
       sendStopChunk(res, model);
       sendSseDone(res);

@@ -396,7 +396,7 @@ const buildAgentJoinPayload = (overrides = {}) => {
       resolveEnv(
         'AGORA_AGENT_GREETING_MESSAGE',
         'VITE_AGORA_AGENT_GREETING_MESSAGE'
-      ) ?? 'Hello, how can I help you?';
+      ) ?? 'Hi, I\'m Aiden, your Agora checklist assistant. To kick things off, are you seeing any mixed usage of string and integer RTC UIDs in your implementation?';
     const failureMessage =
       resolveEnv(
         'AGORA_AGENT_FAILURE_MESSAGE',
