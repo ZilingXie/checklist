@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import AgoraRTC from 'agora-rtc-sdk-ng';
 import CallStatusBar from '../components/CallStatusBar.jsx';
@@ -26,6 +26,13 @@ const initialChecklist = [
     recommendation: ''
   }
 ];
+
+const AGENT_AUDIO_LEVEL_INTERVAL = 120;
+const AGENT_AUDIO_ACTIVE_THRESHOLD = 0.04;
+const AGENT_AUDIO_INACTIVE_THRESHOLD = 0.015;
+const AGENT_AUDIO_SILENCE_DURATION = 1100;
+const AGENT_SILENCE_DEBOUNCE_MS = 600;
+const AGENT_LISTENING_RESUME_DELAY_MS = 900;
 
 const sanitizeBaseUrl = (value) => {
   if (!value || typeof value !== 'string') return '';
@@ -120,6 +127,8 @@ const CallPage = () => {
   const agoraSessionContextRef = useRef(null);
   const hasResetChecklistRef = useRef(false);
   const agentSpeakingRef = useRef(false);
+  const agentSilenceTimeoutRef = useRef(null);
+  const agentAudioMonitorRef = useRef(null);
   const resumeListeningTimeoutRef = useRef(null);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('idle');
@@ -127,6 +136,7 @@ const CallPage = () => {
   const [checklist, setChecklist] = useState(initialChecklist);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [callActive, setCallActive] = useState(true);
+  const callActiveRef = useRef(true);
   const [isProcessing, setIsProcessing] = useState(false);
   const [audioDevices, setAudioDevices] = useState([{ deviceId: 'default', label: 'System Default' }]);
   const [selectedDeviceId, setSelectedDeviceId] = useState('default');
@@ -142,6 +152,40 @@ const CallPage = () => {
   useEffect(() => {
     selectedDeviceIdRef.current = selectedDeviceId;
   }, [selectedDeviceId]);
+
+  useEffect(() => {
+    callActiveRef.current = callActive;
+  }, [callActive]);
+
+  const applyAgentActivityUi = useCallback(
+    (activity) => {
+      if (!isComponentMountedRef.current) {
+        return;
+      }
+
+      if (!isAgentConnected) {
+        setStatusLabel('Agent not connected');
+        setCallTone('idle');
+        return;
+      }
+
+      if (activity === 'speaking') {
+        setStatusLabel('Agent speaking');
+        setCallTone('speaking');
+        return;
+      }
+
+      if (activity === 'listening') {
+        setStatusLabel('Agent listening');
+        setCallTone('listening');
+        return;
+      }
+
+      setStatusLabel('Agent connected');
+      setCallTone('connected');
+    },
+    [isAgentConnected]
+  );
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.sessionStorage === 'undefined') {
@@ -214,9 +258,17 @@ const CallPage = () => {
   }, []);
 
   useEffect(() => {
-    setStatusLabel(isAgentConnected ? 'Agent connected' : 'Agent not connected');
-    setCallTone(isAgentConnected ? 'connected' : 'idle');
-  }, [isAgentConnected]);
+    if (!isAgentConnected) {
+      setStatusLabel('Agent not connected');
+      setCallTone('idle');
+      return;
+    }
+    if (agentSpeakingRef.current) {
+      applyAgentActivityUi('speaking');
+    } else {
+      applyAgentActivityUi('listening');
+    }
+  }, [applyAgentActivityUi, isAgentConnected]);
 
   useEffect(() => {
     checklistApiBaseRef.current = checklistApiBase;
@@ -518,14 +570,14 @@ const CallPage = () => {
     };
 
     recognition.onerror = () => {
-      if (callActive) {
+      if (callActiveRef.current) {
         recognition.stop();
         scheduleResumeListening(1000);
       }
     };
 
     recognition.onend = () => {
-      if (!callActive) return;
+      if (!callActiveRef.current) return;
       if (agentSpeakingRef.current) {
         return;
       }
@@ -561,6 +613,7 @@ const CallPage = () => {
         const existingEntry = remoteTracksForSession.get(user.uid);
         const existingTrack = existingEntry?.track;
         if (existingTrack) {
+          stopAgentAudioMonitor({ track: existingTrack, immediate: false });
           if (typeof existingTrack.off === 'function' && existingEntry.onPlayerStateChange) {
             existingTrack.off('player-state-change', existingEntry.onPlayerStateChange);
           }
@@ -571,16 +624,18 @@ const CallPage = () => {
           }
         }
 
+        const canMonitorLevel = typeof remoteAudioTrack.getAudioLevel === 'function';
         const handlePlayerStateChange = (state) => {
           if (state === 'playing') {
             handleAgentSpeakingChange(true);
           } else if (
-            state === 'stopped' ||
-            state === 'paused' ||
-            state === 'idle' ||
-            state === 'ended' ||
-            state === 'failed' ||
-            state === 'aborted'
+            !canMonitorLevel &&
+            (state === 'stopped' ||
+              state === 'paused' ||
+              state === 'idle' ||
+              state === 'ended' ||
+              state === 'failed' ||
+              state === 'aborted')
           ) {
             handleAgentSpeakingChange(false);
           }
@@ -593,6 +648,7 @@ const CallPage = () => {
           track: remoteAudioTrack,
           onPlayerStateChange: handlePlayerStateChange
         });
+        startAgentAudioMonitor(remoteAudioTrack);
       } catch (error) {
         console.error('Failed to subscribe to remote audio', error);
       }
@@ -601,6 +657,7 @@ const CallPage = () => {
     const handleRemoteAudioRemoved = (user) => {
       const entry = remoteTracksForSession.get(user.uid);
       if (entry?.track) {
+        stopAgentAudioMonitor({ track: entry.track });
         if (typeof entry.track.off === 'function' && entry.onPlayerStateChange) {
           entry.track.off('player-state-change', entry.onPlayerStateChange);
         }
@@ -655,7 +712,10 @@ const CallPage = () => {
 
     return () => {
       recognition.stop();
+      callActiveRef.current = false;
+      clearAgentSilenceTimeout();
       clearResumeListeningTimeout();
+      stopAgentAudioMonitor({ immediate: false });
       stopVolumeMonitor();
       stopLocalStream();
       client.off('user-published', handleRemoteAudioPublished);
@@ -763,6 +823,7 @@ const CallPage = () => {
       if (!remoteTrack) {
         return;
       }
+      stopAgentAudioMonitor({ track: remoteTrack });
       if (typeof remoteTrack.off === 'function' && entry.onPlayerStateChange) {
         remoteTrack.off('player-state-change', entry.onPlayerStateChange);
       }
@@ -772,10 +833,12 @@ const CallPage = () => {
         console.error(`Failed to stop remote Agora track for user ${uid}`, error);
       }
     });
+    stopAgentAudioMonitor();
     tracks?.clear();
     if (tracks && remoteAudioTracksRef.current === tracks) {
       remoteAudioTracksRef.current = new Map();
     }
+    clearAgentSilenceTimeout();
     agentSpeakingRef.current = false;
     clearResumeListeningTimeout();
 
@@ -801,7 +864,7 @@ const CallPage = () => {
   };
 
   const joinAgoraVoiceCall = async (sessionContext = agoraSessionContextRef.current) => {
-    if (!callActive) return;
+    if (!callActiveRef.current) return;
     if (!AGORA_APP_ID || !AGORA_CHANNEL) {
       console.warn('Missing Agora credentials. Voice call join skipped.');
       void resetChecklistForNewCall();
@@ -1025,13 +1088,13 @@ const CallPage = () => {
       setIsDeviceMenuOpen(false);
     }
 
-    if (!success || !callActive) return;
+    if (!success || !callActiveRef.current) return;
     stopListening();
     scheduleResumeListening(500);
   };
 
   const greetAndStart = () => {
-    if (!callActive || hasGreetedRef.current) return;
+    if (!callActiveRef.current || hasGreetedRef.current) return;
     hasGreetedRef.current = true;
     if (agentSpeakingRef.current) {
       return;
@@ -1040,7 +1103,7 @@ const CallPage = () => {
   };
 
   const startListening = () => {
-    if (!callActive) return;
+    if (!callActiveRef.current) return;
     const recognition = recognitionRef.current;
     if (!recognition) return;
 
@@ -1063,40 +1126,152 @@ const CallPage = () => {
     }
   };
 
+  const clearAgentSilenceTimeout = () => {
+    if (agentSilenceTimeoutRef.current !== null) {
+      clearTimeout(agentSilenceTimeoutRef.current);
+      agentSilenceTimeoutRef.current = null;
+    }
+  };
+
   const scheduleResumeListening = (delay = 400) => {
     clearResumeListeningTimeout();
     resumeListeningTimeoutRef.current = setTimeout(() => {
       resumeListeningTimeoutRef.current = null;
-      if (!callActive || agentSpeakingRef.current) {
+      if (!callActiveRef.current || agentSpeakingRef.current) {
         return;
       }
       startListening();
     }, delay);
   };
 
-  const handleAgentSpeakingChange = (isSpeaking) => {
-    if (agentSpeakingRef.current === isSpeaking) {
-      return;
-    }
-
-    agentSpeakingRef.current = isSpeaking;
-
-    if (!isComponentMountedRef.current) {
-      return;
-    }
+  const handleAgentSpeakingChange = (isSpeaking, options = {}) => {
+    const { immediate = false } = options;
 
     if (isSpeaking) {
+      if (!agentSpeakingRef.current) {
+        agentSpeakingRef.current = true;
+      }
+      clearAgentSilenceTimeout();
+      if (!isComponentMountedRef.current) {
+        return;
+      }
+      applyAgentActivityUi('speaking');
       clearResumeListeningTimeout();
       stopListening();
-    } else {
-      if (callActive) {
-        scheduleResumeListening();
+      return;
+    }
+
+    if (!agentSpeakingRef.current) {
+      return;
+    }
+
+    if (immediate) {
+      clearAgentSilenceTimeout();
+      agentSpeakingRef.current = false;
+      if (isComponentMountedRef.current) {
+        applyAgentActivityUi('listening');
       }
+      if (callActiveRef.current) {
+        scheduleResumeListening(AGENT_LISTENING_RESUME_DELAY_MS);
+      }
+      return;
+    }
+
+    if (!isComponentMountedRef.current) {
+      agentSpeakingRef.current = false;
+      return;
+    }
+
+    if (agentSilenceTimeoutRef.current !== null) {
+      return;
+    }
+
+    agentSilenceTimeoutRef.current = setTimeout(() => {
+      agentSilenceTimeoutRef.current = null;
+      agentSpeakingRef.current = false;
+      if (!isComponentMountedRef.current) {
+        return;
+      }
+      applyAgentActivityUi('listening');
+      if (callActiveRef.current) {
+        scheduleResumeListening(AGENT_LISTENING_RESUME_DELAY_MS);
+      }
+    }, AGENT_SILENCE_DEBOUNCE_MS);
+  };
+
+  const stopAgentAudioMonitor = ({ immediate = true, track } = {}) => {
+    const monitor = agentAudioMonitorRef.current;
+    if (monitor && track && monitor.track && monitor.track !== track) {
+      return;
+    }
+
+    if (typeof window !== 'undefined' && monitor?.timer !== undefined && monitor?.timer !== null) {
+      window.clearInterval(monitor.timer);
+    }
+
+    if (!monitor || !track || !monitor.track || monitor.track === track) {
+      agentAudioMonitorRef.current = null;
+    }
+
+    if (immediate) {
+      handleAgentSpeakingChange(false, { immediate: true });
     }
   };
 
+  const startAgentAudioMonitor = (remoteAudioTrack) => {
+    if (typeof window === 'undefined' || !remoteAudioTrack) {
+      return;
+    }
+
+    const wasSpeaking = agentSpeakingRef.current;
+    stopAgentAudioMonitor({ immediate: false });
+
+    if (typeof remoteAudioTrack.getAudioLevel !== 'function') {
+      if (wasSpeaking) {
+        handleAgentSpeakingChange(true);
+      }
+      return;
+    }
+
+    const monitorState = {
+      timer: null,
+      isSpeaking: wasSpeaking,
+      lastActiveAt: Date.now(),
+      track: remoteAudioTrack
+    };
+
+    const pollAudioLevel = () => {
+      const level = remoteAudioTrack.getAudioLevel?.() ?? 0;
+      const now = Date.now();
+      const threshold = monitorState.isSpeaking
+        ? AGENT_AUDIO_INACTIVE_THRESHOLD
+        : AGENT_AUDIO_ACTIVE_THRESHOLD;
+
+      if (level >= threshold) {
+        monitorState.lastActiveAt = now;
+        if (!monitorState.isSpeaking) {
+          monitorState.isSpeaking = true;
+          handleAgentSpeakingChange(true);
+        }
+        return;
+      }
+
+      if (
+        monitorState.isSpeaking &&
+        now - monitorState.lastActiveAt >= AGENT_AUDIO_SILENCE_DURATION
+      ) {
+        monitorState.isSpeaking = false;
+        handleAgentSpeakingChange(false);
+      }
+    };
+
+    monitorState.timer = window.setInterval(pollAudioLevel, AGENT_AUDIO_LEVEL_INTERVAL);
+    agentAudioMonitorRef.current = monitorState;
+    pollAudioLevel();
+  };
+
   const handleUserSpeech = async (text) => {
-    if (!callActive) return;
+    if (!callActiveRef.current) return;
 
     stopListening();
 
@@ -1109,7 +1284,7 @@ const CallPage = () => {
 
     setIsProcessing(false);
 
-    if (!callActive) return;
+    if (!callActiveRef.current) return;
 
     if (agentSpeakingRef.current) {
       return;
@@ -1123,6 +1298,7 @@ const CallPage = () => {
       return;
     }
     recognitionRef.current?.stop();
+    clearAgentSilenceTimeout();
     clearResumeListeningTimeout();
     agentSpeakingRef.current = false;
   }, [callActive, isChecklistComplete]);
@@ -1221,6 +1397,8 @@ const CallPage = () => {
   };
 
   const handleEndCall = async () => {
+    callActiveRef.current = false;
+    clearAgentSilenceTimeout();
     clearResumeListeningTimeout();
     agentSpeakingRef.current = false;
     setCallActive(false);
