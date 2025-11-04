@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 
+import { resolveAgentControllerEndpoint } from '../utils/agentController.js';
+
 const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
 const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
 const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN ?? '';
@@ -18,42 +20,6 @@ const AGENT_CONTROLLER_URL =
   import.meta.env.VITE_AGENT_CONTROLLER_URL ??
   import.meta.env.VITE_AI_AGENT_SERVER_URL ??
   '';
-const resolveAgentControllerEndpoint = (baseUrl, action) => {
-  if (!baseUrl) return '';
-
-  const trimmedBase = baseUrl.trim();
-  if (!trimmedBase) return '';
-
-  const normalizedBase = trimmedBase.replace(/\/+$/, '');
-  const expectedSuffix = `/agent/${action}`;
-  if (normalizedBase.endsWith(expectedSuffix)) {
-    return normalizedBase;
-  }
-
-  try {
-    const origin =
-      typeof window !== 'undefined' && window.location
-        ? window.location.origin
-        : 'http://localhost';
-    const url = new URL(normalizedBase, origin);
-    const segments = url.pathname.split('/').filter(Boolean);
-
-    if (segments[segments.length - 1] === action) {
-      segments.pop();
-    }
-    if (segments[segments.length - 1] !== 'agent') {
-      segments.push('agent');
-    }
-    segments.push(action);
-    url.pathname = `/${segments.join('/')}`;
-    return url.toString().replace(/\/+$/, '');
-  } catch {
-    if (normalizedBase.endsWith('/agent')) {
-      return `${normalizedBase}/${action}`;
-    }
-    return `${normalizedBase}/agent/${action}`;
-  }
-};
 
 const AGENT_JOIN_ENDPOINT = resolveAgentControllerEndpoint(AGENT_CONTROLLER_URL, 'join');
 const AGENT_CONTROLLER_AUTH_TOKEN =

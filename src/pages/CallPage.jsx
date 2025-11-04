@@ -5,6 +5,7 @@ import CallStatusBar from '../components/CallStatusBar.jsx';
 import ConversationVisualizer from '../components/ConversationVisualizer.jsx';
 import ChecklistSidebar from '../components/ChecklistSidebar.jsx';
 import CallControls from '../components/CallControls.jsx';
+import { resolveAgentControllerEndpoint } from '../utils/agentController.js';
 
 const initialChecklist = [
   {
@@ -82,9 +83,7 @@ const AGORA_UID = Number.isFinite(parsedAgoraUid) ? parsedAgoraUid : null;
 const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
 const AGENT_CONTROLLER_URL =
   import.meta.env.VITE_AGENT_CONTROLLER_URL ?? import.meta.env.VITE_AI_AGENT_SERVER_URL ?? '';
-const AGENT_LEAVE_ENDPOINT = AGENT_CONTROLLER_URL
-  ? `${AGENT_CONTROLLER_URL.replace(/\/$/, '')}/agent/leave`
-  : '';
+const AGENT_LEAVE_ENDPOINT = resolveAgentControllerEndpoint(AGENT_CONTROLLER_URL, 'leave');
 const AGENT_CONTROLLER_AUTH_TOKEN =
   import.meta.env.VITE_AGENT_CONTROLLER_AUTH_TOKEN ??
   import.meta.env.VITE_AGENT_CONTROLLER_AUTH_SECRET ??
