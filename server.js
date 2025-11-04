@@ -1,40 +1,52 @@
 import http from 'node:http';
-import { URL } from 'node:url';
+import { URL, fileURLToPath } from 'node:url';
 import { env } from 'node:process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 
+const moduleDirectory = resolvePath(fileURLToPath(new URL('.', import.meta.url)));
+
 const loadDotEnv = (fileName = '.env') => {
   try {
-    const envPath = resolvePath(process.cwd(), fileName);
-    if (!existsSync(envPath)) {
-      return;
+    const candidatePaths = [];
+    if (process.cwd()) {
+      candidatePaths.push(resolvePath(process.cwd(), fileName));
     }
+    candidatePaths.push(resolvePath(moduleDirectory, fileName));
 
-    const fileContents = readFileSync(envPath, 'utf8');
-    const lines = fileContents.split(/\r?\n/);
+    const visited = new Set();
 
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
+    for (const envPath of candidatePaths) {
+      if (visited.has(envPath)) continue;
+      visited.add(envPath);
 
-      const delimiterIndex = line.indexOf('=');
-      if (delimiterIndex === -1) continue;
+      if (!existsSync(envPath)) continue;
 
-      const key = line.slice(0, delimiterIndex).trim();
-      if (!key) continue;
+      const fileContents = readFileSync(envPath, 'utf8');
+      const lines = fileContents.split(/\r?\n/);
 
-      let value = line.slice(delimiterIndex + 1).trim();
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
 
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
-      }
+        const delimiterIndex = line.indexOf('=');
+        if (delimiterIndex === -1) continue;
 
-      if (!(key in env)) {
-        env[key] = value;
+        const key = line.slice(0, delimiterIndex).trim();
+        if (!key) continue;
+
+        let value = line.slice(delimiterIndex + 1).trim();
+
+        if (
+          (value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))
+        ) {
+          value = value.slice(1, -1);
+        }
+
+        if (!(key in env)) {
+          env[key] = value;
+        }
       }
     }
   } catch (error) {
@@ -793,6 +805,48 @@ const server = http.createServer(async (req, res) => {
   respondJson(res, 404, { error: 'Not found' }, origin);
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Agent controller listening on http://${HOST}:${PORT}`);
+let isListening = false;
+const desiredHost = HOST || '0.0.0.0';
+const candidateHosts = [desiredHost];
+if (desiredHost === '0.0.0.0') {
+  candidateHosts.push('127.0.0.1');
+} else if (desiredHost === '::' || desiredHost === '::0') {
+  candidateHosts.push('::1');
+}
+let hostIndex = 0;
+
+server.on('listening', () => {
+  isListening = true;
 });
+
+server.on('error', (error) => {
+  if (!isListening) {
+    const currentHost = candidateHosts[hostIndex];
+    const nextHost = candidateHosts[hostIndex + 1];
+    if (
+      nextHost &&
+      (error.code === 'EACCES' ||
+        error.code === 'EADDRINUSE' ||
+        error.code === 'EPERM')
+    ) {
+      console.warn(
+        `Agent controller failed to bind to http://${currentHost}:${PORT} (${error.code}). Retrying with ${nextHost}.`
+      );
+      hostIndex += 1;
+      server.listen(PORT, nextHost);
+      return;
+    }
+  }
+
+  console.error('Agent controller encountered a server error', error);
+});
+
+const startServer = () => {
+  const host = candidateHosts[hostIndex];
+  server.listen(PORT, host, () => {
+    const boundHost = host !== desiredHost ? `${host} (fallback)` : host;
+    console.log(`Agent controller listening on http://${boundHost}:${PORT}`);
+  });
+};
+
+startServer();

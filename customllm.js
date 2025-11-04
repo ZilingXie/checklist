@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { URL, pathToFileURL } from 'node:url';
+import { URL, fileURLToPath, pathToFileURL } from 'node:url';
 import { env } from 'node:process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
@@ -182,34 +182,46 @@ const resetChecklist = () => {
   broadcastChecklistUpdate();
 };
 
+const moduleDirectory = resolvePath(fileURLToPath(new URL('.', import.meta.url)));
+
 const loadDotEnvFile = (fileName) => {
   try {
-    const envPath = resolvePath(process.cwd(), fileName);
-    if (!existsSync(envPath)) {
-      return;
+    const candidatePaths = [];
+    if (process.cwd()) {
+      candidatePaths.push(resolvePath(process.cwd(), fileName));
     }
+    candidatePaths.push(resolvePath(moduleDirectory, fileName));
 
-    const contents = readFileSync(envPath, 'utf8');
-    for (const rawLine of contents.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
+    const visited = new Set();
 
-      const delimiterIndex = line.indexOf('=');
-      if (delimiterIndex === -1) continue;
+    for (const envPath of candidatePaths) {
+      if (visited.has(envPath)) continue;
+      visited.add(envPath);
 
-      const key = line.slice(0, delimiterIndex).trim();
-      if (!key) continue;
+      if (!existsSync(envPath)) continue;
 
-      let value = line.slice(delimiterIndex + 1).trim();
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
-      }
+      const contents = readFileSync(envPath, 'utf8');
+      for (const rawLine of contents.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
 
-      if (!(key in env)) {
-        env[key] = value;
+        const delimiterIndex = line.indexOf('=');
+        if (delimiterIndex === -1) continue;
+
+        const key = line.slice(0, delimiterIndex).trim();
+        if (!key) continue;
+
+        let value = line.slice(delimiterIndex + 1).trim();
+        if (
+          (value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))
+        ) {
+          value = value.slice(1, -1);
+        }
+
+        if (!(key in env)) {
+          env[key] = value;
+        }
       }
     }
   } catch (error) {
