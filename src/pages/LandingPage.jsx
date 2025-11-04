@@ -1,112 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 
-import { resolveAgentControllerEndpoint } from '../utils/agentController.js';
-
-const AGORA_APP_ID = import.meta.env.VITE_AGORA_APP_ID;
-const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
-const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN ?? '';
-const AGORA_AGENT_NAME = import.meta.env.VITE_AGORA_AGENT_NAME ?? 'checklist-agent';
-const AGORA_AGENT_RTC_UID = import.meta.env.VITE_AGORA_AGENT_RTC_UID ?? '0';
-const AGORA_AGENT_REMOTE_UIDS = import.meta.env.VITE_AGORA_AGENT_REMOTE_UIDS ?? '*';
-const AGORA_AGENT_ENABLE_STRING_UID =
-  (import.meta.env.VITE_AGORA_AGENT_ENABLE_STRING_UID ?? 'false').toLowerCase() === 'true';
-const AGORA_AGENT_IDLE_TIMEOUT = Number.parseInt(
-  import.meta.env.VITE_AGORA_AGENT_IDLE_TIMEOUT ?? '',
-  10
-);
-const AGORA_AGENT_ASR_LANGUAGE = import.meta.env.VITE_AGORA_AGENT_ASR_LANGUAGE ?? 'en-US';
-const AGENT_CONTROLLER_URL =
-  import.meta.env.VITE_AGENT_CONTROLLER_URL ??
-  import.meta.env.VITE_AI_AGENT_SERVER_URL ??
-  '';
-
-const AGENT_JOIN_ENDPOINT = resolveAgentControllerEndpoint(AGENT_CONTROLLER_URL, 'join');
-const AGENT_CONTROLLER_AUTH_TOKEN =
-  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_TOKEN ??
-  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_SECRET ??
-  '';
-
-const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
-
-const parseRemoteRtcUids = (value) => {
-  if (!value) return ['*'];
-  const parsed = value
-    .split(',')
-    .map((uid) => uid.trim())
-    .filter(Boolean);
-  return parsed.length > 0 ? parsed : ['*'];
-};
-
-const resolveIdleTimeout = () =>
-  Number.isFinite(AGORA_AGENT_IDLE_TIMEOUT) ? AGORA_AGENT_IDLE_TIMEOUT : 120;
-
-const extractAgentSessionDetails = (payload) => {
-  if (!payload || typeof payload !== 'object') {
-    return null;
-  }
-
-  const agentPayload =
-    typeof payload.agent === 'object' && payload.agent !== null ? payload.agent : undefined;
-  const directAgentId =
-    payload.agent_id ?? payload.agentId ?? payload.id ?? agentPayload?.agent_id ?? agentPayload?.id;
-  if (!directAgentId) {
-    return null;
-  }
-
-  const agentId = String(directAgentId);
-  const resolvedProjectId =
-    payload.project_id ??
-    payload.projectId ??
-    agentPayload?.project_id ??
-    agentPayload?.projectId ??
-    AGORA_APP_ID ??
-    undefined;
-
-  return {
-    agentId,
-    projectId: resolvedProjectId ? String(resolvedProjectId) : undefined,
-    recordedAt: Date.now()
-  };
-};
-
-const persistAgentSessionDetails = (details) => {
-  if (typeof window === 'undefined' || typeof window.sessionStorage === 'undefined') {
-    return;
-  }
-
-  const storage = window.sessionStorage;
-
-  if (!details) {
-    storage.removeItem(AGORA_AGENT_LAST_JOIN_KEY);
-    return;
-  }
-
-  try {
-    storage.setItem(AGORA_AGENT_LAST_JOIN_KEY, JSON.stringify(details));
-  } catch (error) {
-    console.warn('Unable to persist Agora agent session details', error);
-  }
-};
-
-const buildAgentJoinRequest = () => {
-  if (!AGORA_CHANNEL) {
-    return null;
-  }
-
-  return {
-    agentName: AGORA_AGENT_NAME,
-    channel: AGORA_CHANNEL,
-    token: AGORA_TOKEN ?? '',
-    agentRtcUid: AGORA_AGENT_RTC_UID,
-    remoteRtcUids: parseRemoteRtcUids(AGORA_AGENT_REMOTE_UIDS),
-    enableStringUid: AGORA_AGENT_ENABLE_STRING_UID,
-    idleTimeout: resolveIdleTimeout(),
-    asr: {
-      language: AGORA_AGENT_ASR_LANGUAGE
-    }
-  };
-};
+import {
+  AGENT_JOIN_ENDPOINT,
+  buildAgentJoinRequest,
+  clearAgentSessionDetails,
+  persistAgentSessionDetails,
+  requestAgentJoin,
+  resolveAgentIdentifiers
+} from '../utils/agentSession.js';
 
 const LandingPage = () => {
   const overviewRef = useRef(null);
@@ -146,86 +48,71 @@ const LandingPage = () => {
       return;
     }
 
-    if (!AGORA_CHANNEL) {
-      console.warn('Missing Agora channel. Skipping agent join request.');
-      return;
-    }
-
-    if (typeof fetch !== 'function') {
-      console.warn('Fetch API unavailable. Skipping agent join request.');
-      return;
-    }
-
     const payload = buildAgentJoinRequest();
     if (!payload) {
       console.warn('Unable to build agent join request payload. Skipping agent join request.');
       return;
     }
 
-    persistAgentSessionDetails(null);
+    clearAgentSessionDetails();
 
-    try {
-      const headers = {
-        'Content-Type': 'application/json'
-      };
+    const attemptJoin = async ({ allowConflictRetry = true } = {}) => {
+      const result = await requestAgentJoin(payload);
 
-      if (AGENT_CONTROLLER_AUTH_TOKEN) {
-        headers.Authorization = `Bearer ${AGENT_CONTROLLER_AUTH_TOKEN}`;
-      }
+      if (!result.ok) {
+        if (result.status === 409) {
+          const identifiers = resolveAgentIdentifiers(result.parsedBody);
 
-      const response = await fetch(AGENT_JOIN_ENDPOINT, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-        keepalive: true
-      });
+          if (identifiers?.agentId) {
+            persistAgentSessionDetails({
+              agentId: identifiers.agentId,
+              projectId: identifiers.projectId,
+              leaveUrl: identifiers.leaveUrl,
+              recordedAt: Date.now()
+            });
+            return true;
+          } else {
+            console.warn(
+              'Agent controller join conflict response did not include an agent identifier.'
+            );
+          }
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Agent controller join request failed', {
-          status: response.status,
-          statusText: response.statusText,
-          body: errorText
-        });
-        return;
-      }
-
-      let parsedBody;
-      try {
-        const responseClone = response.clone();
-        const contentType = responseClone.headers.get('Content-Type') ?? '';
-        if (contentType.includes('application/json')) {
-          parsedBody = await responseClone.json();
-        } else {
-          const rawText = await responseClone.text();
-          if (rawText) {
-            try {
-              parsedBody = JSON.parse(rawText);
-            } catch {
-              console.warn('Agora agent join response returned non-JSON content.');
-            }
+          if (allowConflictRetry) {
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            return attemptJoin({ allowConflictRetry: false });
           }
         }
-      } catch (parseError) {
-        console.warn('Unable to parse Agora agent join response', parseError);
+
+        if (result.error) {
+          console.error('Failed to invoke agent controller join request', result.error);
+        } else if (result.reason === 'missing_configuration') {
+          console.error('Agent controller join failed: configuration is missing.');
+        } else if (result.reason === 'missing_payload') {
+          console.error('Agent controller join failed: payload could not be constructed.');
+        } else if (result.reason === 'fetch_unavailable') {
+          console.error('Agent controller join failed: Fetch API unavailable in this environment.');
+        } else {
+          console.error('Agent controller join request failed', {
+            status: result.status,
+            statusText: result.statusText,
+            body: result.body
+          });
+        }
+        return false;
       }
 
-      const sessionDetails = extractAgentSessionDetails(parsedBody);
-      if (sessionDetails) {
-        const { agentId, projectId } = sessionDetails;
-        if (projectId) {
-          sessionDetails.leaveUrl = `https://api.agora.io/api/conversational-ai-agent/v2/projects/${projectId}/agents/${agentId}/leave`;
-        } else if (AGORA_APP_ID) {
-          sessionDetails.projectId = AGORA_APP_ID;
-          sessionDetails.leaveUrl = `https://api.agora.io/api/conversational-ai-agent/v2/projects/${AGORA_APP_ID}/agents/${agentId}/leave`;
-        }
-        persistAgentSessionDetails(sessionDetails);
-      } else {
+      if (result.parsedBody === undefined && result.body) {
+        console.warn('Agora agent join response returned non-JSON content.');
+      }
+
+      if (!result.sessionDetails) {
         console.warn('Agora agent join response missing agent identifier. Leave request will be skipped.');
       }
-    } catch (error) {
-      console.error('Failed to invoke agent controller join request', error);
-    }
+
+      return true;
+    };
+
+    await attemptJoin();
   };
 
   const handleJoinCallClick = () => {

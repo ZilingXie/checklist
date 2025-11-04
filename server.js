@@ -112,6 +112,71 @@ const parseRemoteRtcUids = (input, fallback = ['*']) => {
   return fallback;
 };
 
+const normalizeHttpUrl = (value) => {
+  if (typeof value !== 'string') return undefined;
+  let normalized = value.trim();
+  if (!normalized) return undefined;
+
+  const repairs = [
+    [/^hhttps:\/\//i, 'https://'],
+    [/^httpss:\/\//i, 'https://'],
+    [/^https?:\/\/https:\/\//i, 'https://'],
+    [/^https?:\/\/http:\/\//i, 'http://']
+  ];
+
+  for (const [pattern, replacement] of repairs) {
+    if (pattern.test(normalized)) {
+      normalized = normalized.replace(pattern, replacement);
+    }
+  }
+
+  if (!/^[a-z][\w.+-]*:\/\//i.test(normalized)) {
+    normalized = `https://${normalized}`;
+  }
+
+  try {
+    const url = new URL(normalized);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return undefined;
+    }
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+};
+
+const pickFirstValidHttpUrl = (candidates = []) => {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const rawValue = candidate.value;
+    if (rawValue === undefined || rawValue === null) continue;
+    const stringValue = String(rawValue).trim();
+    if (!stringValue) continue;
+
+    const normalized = normalizeHttpUrl(stringValue);
+    if (!normalized) {
+      if (!candidate.silent) {
+        const label = candidate.label ?? candidate.source ?? 'LLM URL';
+        console.warn(`[server.js] Ignoring invalid URL configured for ${label}: ${stringValue}`);
+      }
+      continue;
+    }
+
+    if (!candidate.silent && normalized !== stringValue) {
+      const label = candidate.label ?? candidate.source ?? 'LLM URL';
+      console.warn(
+        `[server.js] Normalized ${label} from "${stringValue}" to "${normalized}".`
+      );
+    }
+
+    return { url: normalized, source: candidate.source ?? null };
+  }
+
+  return undefined;
+};
+
 const allowedOrigins = (() => {
   const configured =
     resolveEnv('ALLOWED_ORIGINS', 'CORS_ALLOWED_ORIGINS') ?? '*';
@@ -384,16 +449,36 @@ const buildAgentJoinPayload = (overrides = {}) => {
   };
 
   const defaultCustomLlmUrl = 'http://localhost:3100/chat/completions';
-  const customLlmUrl = resolveEnv(
+  const customLlmUrlRaw = resolveEnv(
     'CUSTOM_LLM_PUBLIC_URL',
     'VITE_CUSTOM_LLM_PUBLIC_URL'
   );
-  const configuredLlmUrl = resolveEnv(
+  const configuredLlmUrlRaw = resolveEnv(
     'AGORA_AGENT_LLM_URL',
     'VITE_AGORA_AGENT_LLM_URL'
   );
-  const llmUrl = customLlmUrl ?? configuredLlmUrl ?? defaultCustomLlmUrl;
-  const isCustomLlm = Boolean(customLlmUrl) || llmUrl === defaultCustomLlmUrl;
+
+  const llmResolution = pickFirstValidHttpUrl([
+    {
+      value: customLlmUrlRaw,
+      source: 'custom',
+      label: 'CUSTOM_LLM_PUBLIC_URL / VITE_CUSTOM_LLM_PUBLIC_URL'
+    },
+    {
+      value: configuredLlmUrlRaw,
+      source: 'configured',
+      label: 'AGORA_AGENT_LLM_URL / VITE_AGORA_AGENT_LLM_URL'
+    },
+    {
+      value: defaultCustomLlmUrl,
+      source: 'default',
+      silent: true
+    }
+  ]);
+
+  const llmUrl = llmResolution?.url;
+  const llmSource = llmResolution?.source;
+  const isCustomLlm = llmSource === 'custom' || llmSource === 'default';
 
   if (llmUrl) {
     const llmApiKey = isCustomLlm
@@ -452,6 +537,10 @@ const buildAgentJoinPayload = (overrides = {}) => {
     }
 
     properties.llm = llmConfig;
+  } else {
+    console.warn(
+      '[server.js] No valid LLM URL was resolved from configuration; the agent will rely on its failure message.'
+    );
   }
 
   const ttsKey = resolveEnv(

@@ -5,7 +5,16 @@ import CallStatusBar from '../components/CallStatusBar.jsx';
 import ConversationVisualizer from '../components/ConversationVisualizer.jsx';
 import ChecklistSidebar from '../components/ChecklistSidebar.jsx';
 import CallControls from '../components/CallControls.jsx';
-import { resolveAgentControllerEndpoint } from '../utils/agentController.js';
+import {
+  AGENT_CONTROLLER_AUTH_TOKEN,
+  AGENT_JOIN_ENDPOINT,
+  AGENT_LEAVE_ENDPOINT,
+  AGORA_AGENT_LAST_JOIN_KEY,
+  buildAgentJoinRequest,
+  persistAgentSessionDetails,
+  requestAgentJoin,
+  resolveAgentIdentifiers
+} from '../utils/agentSession.js';
 
 const initialChecklist = [
   {
@@ -37,8 +46,29 @@ const AGENT_LISTENING_RESUME_DELAY_MS = 900;
 
 const sanitizeBaseUrl = (value) => {
   if (!value || typeof value !== 'string') return '';
+
+  let candidate = value.trim();
+  if (!candidate) return '';
+
+  const repairs = [
+    [/^hhttps:\/\//i, 'https://'],
+    [/^httpss:\/\//i, 'https://'],
+    [/^https?:\/\/https:\/\//i, 'https://'],
+    [/^https?:\/\/http:\/\//i, 'http://']
+  ];
+
+  for (const [pattern, replacement] of repairs) {
+    if (pattern.test(candidate)) {
+      candidate = candidate.replace(pattern, replacement);
+    }
+  }
+
+  if (!/^[a-z][\w.+-]*:\/\//i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
   try {
-    const url = new URL(value);
+    const url = new URL(candidate);
     if (url.pathname.endsWith('/chat/completions')) {
       url.pathname = url.pathname.replace(/\/chat\/completions$/, '');
     }
@@ -46,7 +76,7 @@ const sanitizeBaseUrl = (value) => {
     url.hash = '';
     return url.href.replace(/\/$/, '');
   } catch {
-    return value.replace(/\/chat\/completions$/, '').replace(/\/$/, '');
+    return '';
   }
 };
 
@@ -80,14 +110,6 @@ const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
 const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN || null;
 const parsedAgoraUid = Number.parseInt(import.meta.env.VITE_AGORA_UID ?? '', 10);
 const AGORA_UID = Number.isFinite(parsedAgoraUid) ? parsedAgoraUid : null;
-const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
-const AGENT_CONTROLLER_URL =
-  import.meta.env.VITE_AGENT_CONTROLLER_URL ?? import.meta.env.VITE_AI_AGENT_SERVER_URL ?? '';
-const AGENT_LEAVE_ENDPOINT = resolveAgentControllerEndpoint(AGENT_CONTROLLER_URL, 'leave');
-const AGENT_CONTROLLER_AUTH_TOKEN =
-  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_TOKEN ??
-  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_SECRET ??
-  '';
 
 const checklistDefinitionsById = initialChecklist.reduce((acc, item) => {
   acc[item.id] = item;
@@ -129,6 +151,14 @@ const CallPage = () => {
   const agentSilenceTimeoutRef = useRef(null);
   const agentAudioMonitorRef = useRef(null);
   const resumeListeningTimeoutRef = useRef(null);
+  const agentJoinStateRef = useRef({
+    status: 'idle',
+    retryTimer: null,
+    attempts: 0,
+    warnedMissingEndpoint: false,
+    warnedMissingPayload: false
+  });
+  const isAgentConnectedRef = useRef(false);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('idle');
   const [statusLabel, setStatusLabel] = useState('Agent not connected');
@@ -155,6 +185,10 @@ const CallPage = () => {
   useEffect(() => {
     callActiveRef.current = callActive;
   }, [callActive]);
+
+  useEffect(() => {
+    isAgentConnectedRef.current = isAgentConnected;
+  }, [isAgentConnected]);
 
   const applyAgentActivityUi = useCallback(
     (activity) => {
@@ -255,6 +289,169 @@ const CallPage = () => {
       }
     };
   }, []);
+
+  useEffect(() => {
+    const state = agentJoinStateRef.current;
+
+    const clearRetryTimer = () => {
+      if (state.retryTimer !== null) {
+        clearTimeout(state.retryTimer);
+        state.retryTimer = null;
+      }
+    };
+
+    if (!callActive || isAgentConnected) {
+      clearRetryTimer();
+      state.status = 'idle';
+      state.attempts = 0;
+      state.warnedMissingEndpoint = false;
+      state.warnedMissingPayload = false;
+      return undefined;
+    }
+
+    if (!AGENT_JOIN_ENDPOINT) {
+      if (!state.warnedMissingEndpoint) {
+        console.warn(
+          'Missing agent controller endpoint. Agent will remain disconnected until configured.'
+        );
+        state.warnedMissingEndpoint = true;
+      }
+      state.status = 'blocked';
+      return undefined;
+    }
+
+    state.warnedMissingEndpoint = false;
+
+    if (state.status === 'attempting' || state.status === 'awaiting') {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const scheduleRetry = (delay, { resetAttempts = false } = {}) => {
+      clearRetryTimer();
+      if (cancelled) return;
+
+      if (resetAttempts) {
+        state.attempts = 0;
+      } else {
+        state.attempts += 1;
+      }
+
+      state.retryTimer = window.setTimeout(() => {
+        state.retryTimer = null;
+        if (cancelled || !callActiveRef.current) {
+          state.status = 'idle';
+          state.attempts = 0;
+          return;
+        }
+        if (isAgentConnectedRef.current) {
+          state.status = 'idle';
+          state.attempts = 0;
+          return;
+        }
+        state.status = 'idle';
+        void attemptJoin();
+      }, delay);
+    };
+
+    const attemptJoin = async () => {
+      if (cancelled || state.status === 'attempting') {
+        return;
+      }
+
+      const payload = buildAgentJoinRequest();
+      if (!payload) {
+        if (!state.warnedMissingPayload) {
+          console.warn(
+            'Unable to build agent join request payload. Agent will remain disconnected.'
+          );
+          state.warnedMissingPayload = true;
+        }
+        state.status = 'blocked';
+        return;
+      }
+
+      state.warnedMissingPayload = false;
+      state.status = 'attempting';
+
+      const result = await requestAgentJoin(payload);
+      if (cancelled) {
+        return;
+      }
+
+      if (!result.ok) {
+        if (result.status === 409) {
+          const identifiers = resolveAgentIdentifiers(result.parsedBody);
+
+          if (identifiers?.agentId) {
+            persistAgentSessionDetails({
+              agentId: identifiers.agentId,
+              projectId: identifiers.projectId,
+              leaveUrl: identifiers.leaveUrl,
+              recordedAt: Date.now()
+            });
+            setIsAgentConnected(true);
+          } else {
+            console.warn(
+              'Agent controller join conflict response did not include an agent identifier.'
+            );
+          }
+
+          state.status = 'awaiting';
+          scheduleRetry(4000, { resetAttempts: true });
+          return;
+        }
+
+        state.status = 'idle';
+
+        if (result.error) {
+          console.error('Failed to invoke agent controller join request', result.error);
+        } else if (result.reason === 'missing_configuration') {
+          console.error('Agent controller join failed: configuration is missing.');
+          state.status = 'blocked';
+          return;
+        } else if (result.reason === 'missing_payload') {
+          console.error('Agent controller join failed: payload could not be constructed.');
+          state.status = 'blocked';
+          return;
+        } else if (result.reason === 'fetch_unavailable') {
+          console.error('Agent controller join failed: Fetch API unavailable in this environment.');
+        } else {
+          console.error('Agent controller join request failed', {
+            status: result.status,
+            statusText: result.statusText,
+            body: result.body
+          });
+        }
+
+        const nextDelay = Math.min(15000, 3000 * Math.max(1, state.attempts + 1));
+        scheduleRetry(nextDelay);
+        return;
+      }
+
+      if (result.parsedBody === undefined && result.body) {
+        console.warn('Agora agent join response returned non-JSON content.');
+      }
+
+      if (!result.sessionDetails) {
+        console.warn(
+          'Agora agent join response missing agent identifier. Leave request may be skipped.'
+        );
+      }
+
+      state.status = 'awaiting';
+      scheduleRetry(5000, { resetAttempts: true });
+    };
+
+    void attemptJoin();
+
+    return () => {
+      cancelled = true;
+      clearRetryTimer();
+      state.status = 'idle';
+    };
+  }, [callActive, isAgentConnected]);
 
   useEffect(() => {
     if (!isAgentConnected) {
