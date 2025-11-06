@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { URL, pathToFileURL } from 'node:url';
+import { URL, fileURLToPath, pathToFileURL } from 'node:url';
 import { env } from 'node:process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
@@ -182,34 +182,46 @@ const resetChecklist = () => {
   broadcastChecklistUpdate();
 };
 
+const moduleDirectory = resolvePath(fileURLToPath(new URL('.', import.meta.url)));
+
 const loadDotEnvFile = (fileName) => {
   try {
-    const envPath = resolvePath(process.cwd(), fileName);
-    if (!existsSync(envPath)) {
-      return;
+    const candidatePaths = [];
+    if (process.cwd()) {
+      candidatePaths.push(resolvePath(process.cwd(), fileName));
     }
+    candidatePaths.push(resolvePath(moduleDirectory, fileName));
 
-    const contents = readFileSync(envPath, 'utf8');
-    for (const rawLine of contents.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
+    const visited = new Set();
 
-      const delimiterIndex = line.indexOf('=');
-      if (delimiterIndex === -1) continue;
+    for (const envPath of candidatePaths) {
+      if (visited.has(envPath)) continue;
+      visited.add(envPath);
 
-      const key = line.slice(0, delimiterIndex).trim();
-      if (!key) continue;
+      if (!existsSync(envPath)) continue;
 
-      let value = line.slice(delimiterIndex + 1).trim();
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
-      }
+      const contents = readFileSync(envPath, 'utf8');
+      for (const rawLine of contents.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
 
-      if (!(key in env)) {
-        env[key] = value;
+        const delimiterIndex = line.indexOf('=');
+        if (delimiterIndex === -1) continue;
+
+        const key = line.slice(0, delimiterIndex).trim();
+        if (!key) continue;
+
+        let value = line.slice(delimiterIndex + 1).trim();
+        if (
+          (value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))
+        ) {
+          value = value.slice(1, -1);
+        }
+
+        if (!(key in env)) {
+          env[key] = value;
+        }
       }
     }
   } catch (error) {
@@ -405,22 +417,22 @@ registerTool('echo', {
   handler: async (args = {}) => args
 });
 
-const knownChecklistStatuses = new Set(['pending', 'complete', 'pass', 'fail', 'warning']);
+const knownChecklistStatuses = new Set(['pending', 'pass', 'fail', 'warning', 'complete']);
 const checklistStatusAliases = new Map([
-  ['completed', 'complete'],
-  ['done', 'complete'],
-  ['finished', 'complete'],
-  ['resolved', 'complete'],
-  ['yes', 'complete'],
-  ['y', 'complete'],
-  ['affirmative', 'complete'],
+  ['completed', 'pass'],
+  ['done', 'pass'],
+  ['finished', 'pass'],
+  ['resolved', 'pass'],
+  ['yes', 'pass'],
+  ['y', 'pass'],
+  ['affirmative', 'pass'],
   ['pass', 'pass'],
   ['passed', 'pass'],
-  ['ok', 'complete'],
-  ['okay', 'complete'],
-  ['good', 'complete'],
-  ['success', 'complete'],
-  ['successful', 'complete'],
+  ['ok', 'pass'],
+  ['okay', 'pass'],
+  ['good', 'pass'],
+  ['success', 'pass'],
+  ['successful', 'pass'],
   ['no', 'pending'],
   ['not yet', 'pending'],
   ['notyet', 'pending'],
@@ -442,14 +454,45 @@ const normalizeChecklistStatus = (value) => {
   const normalized = String(value).trim().toLowerCase();
   if (!normalized) return undefined;
   if (knownChecklistStatuses.has(normalized)) {
-    return normalized === 'pass' ? 'complete' : normalized;
+    if (normalized === 'complete') {
+      return 'pass';
+    }
+    return normalized;
   }
   const alias = checklistStatusAliases.get(normalized);
   if (alias) {
-    return alias === 'pass' ? 'complete' : alias;
+    return alias;
+  }
+  const sanitized = normalized.replace(/['’]/g, '');
+  const hasPendingWord = /\bpend(?:ing|s|ed)?\b/.test(sanitized);
+  if (!hasPendingWord && /\bpass\b/.test(sanitized)) {
+    const negativePassPatterns = [
+      /\bno\s+pass\b/,
+      /\bnot\s+pass\b/,
+      /\bnever\s+pass\b/,
+      /\bdidnt\s+pass\b/,
+      /\bdid\s+not\s+pass\b/,
+      /\bdoesnt\s+pass\b/,
+      /\bdoes\s+not\s+pass\b/,
+      /\bcan(?:not|t)\s+pass\b/,
+      /\bcould(?:not|nt)\s+pass\b/,
+      /\bshould(?:not|nt)\s+pass\b/,
+      /\bwould(?:not|nt)\s+pass\b/,
+      /\bwill\s+not\s+pass\b/,
+      /\bwont\s+pass\b/,
+      /\bshall\s+not\s+pass\b/,
+      /\bfail(?:ed)?\s+to\s+pass\b/,
+      /\bfailing\s+to\s+pass\b/,
+      /\bunable\s+to\s+pass\b/,
+      /\bnot\s+able\s+to\s+pass\b/
+    ];
+    if (negativePassPatterns.some((pattern) => pattern.test(sanitized))) {
+      return 'fail';
+    }
+    return 'pass';
   }
   if (normalized.startsWith('complete')) {
-    return 'complete';
+    return 'pass';
   }
   if (normalized.startsWith('fail')) {
     return 'fail';
@@ -668,7 +711,7 @@ const buildSessionMemorySummary = (memory) => {
 
   const focusLine = nextPending
     ? `Next pending item: #${nextPending.index + 1} "${nextPending.question}". Ask about this next.`
-    : 'Next pending item: none. The checklist is complete—wrap up the session.';
+    : 'Next pending item: none. All items have been evaluated—wrap up the session.';
 
   return `${lines.join('\n')}\n${focusLine}`;
 };
@@ -768,7 +811,7 @@ registerTool('update_checklist_item_status', {
         type: 'string',
         enum: ['pending', 'complete', 'pass', 'fail', 'warning'],
         description:
-          'New status for the item. "complete" indicates the task is done. "pending" reopens it.'
+          'New status for the item. Use "pass" when the item meets the requirement. "pending" reopens it. "complete" will be treated as "pass" for compatibility.'
       },
       recommendation: {
         type: 'string',
@@ -802,7 +845,7 @@ registerTool('update_checklist_item_status', {
     if (!normalizedStatus) {
       return {
         error:
-          'Invalid status. Use one of: pending, complete, fail, warning. "pass" is treated as complete.'
+          'Invalid status. Use one of: pending, pass, fail, warning. "complete" is treated as pass.'
       };
     }
 
@@ -1349,8 +1392,8 @@ const defaultChecklistInstruction = `You are "Aiden", the Agora deployment check
 2. Review the checklist strictly in order:
    ${checklistSequenceDescription}
 3. Ask about one item at a time and wait for the user's answer before proceeding. Do not skip or merge items.
-4. After each answer, decide whether the item passes or fails. Call update_checklist_item_status with status "complete" for a pass or "fail" when issues remain, and include a short actionable suggestion in the recommendation field.
-5. Confirm the decision to the user (explicitly say pass or fail) before you move on. Once every item is complete, wrap up the review and offer additional help if needed.
+4. After each answer, decide whether the item passes or fails. Call update_checklist_item_status with status "pass" for a pass or "fail" when issues remain, and include a short actionable suggestion in the recommendation field.
+5. Confirm the decision to the user (explicitly say pass or fail) before you move on. Once every item has been marked pass or fail, wrap up the review and offer additional help if needed.
 Use the provided session memory summary to remember progress and avoid repeating questions.`;
 
 const ensureChecklistToolInstruction = (messages) => {

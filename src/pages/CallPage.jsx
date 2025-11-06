@@ -1,10 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import AgoraRTC from 'agora-rtc-sdk-ng';
 import CallStatusBar from '../components/CallStatusBar.jsx';
 import ConversationVisualizer from '../components/ConversationVisualizer.jsx';
 import ChecklistSidebar from '../components/ChecklistSidebar.jsx';
 import CallControls from '../components/CallControls.jsx';
+import {
+  AGENT_CONTROLLER_AUTH_TOKEN,
+  AGENT_JOIN_ENDPOINT,
+  AGENT_LEAVE_ENDPOINT,
+  AGORA_AGENT_LAST_JOIN_KEY,
+  buildAgentJoinRequest,
+  persistAgentSessionDetails,
+  requestAgentJoin,
+  resolveAgentIdentifiers
+} from '../utils/agentSession.js';
 
 const initialChecklist = [
   {
@@ -27,17 +37,33 @@ const initialChecklist = [
   }
 ];
 
-const AGENT_AUDIO_LEVEL_INTERVAL = 120;
-const AGENT_AUDIO_ACTIVE_THRESHOLD = 0.04;
-const AGENT_AUDIO_INACTIVE_THRESHOLD = 0.015;
-const AGENT_AUDIO_SILENCE_DURATION = 1100;
-const AGENT_SILENCE_DEBOUNCE_MS = 600;
-const AGENT_LISTENING_RESUME_DELAY_MS = 900;
+const REMOTE_TRACK_REPLACEMENT_GRACE_MS = 5000;
 
 const sanitizeBaseUrl = (value) => {
   if (!value || typeof value !== 'string') return '';
+
+  let candidate = value.trim();
+  if (!candidate) return '';
+
+  const repairs = [
+    [/^hhttps:\/\//i, 'https://'],
+    [/^httpss:\/\//i, 'https://'],
+    [/^https?:\/\/https:\/\//i, 'https://'],
+    [/^https?:\/\/http:\/\//i, 'http://']
+  ];
+
+  for (const [pattern, replacement] of repairs) {
+    if (pattern.test(candidate)) {
+      candidate = candidate.replace(pattern, replacement);
+    }
+  }
+
+  if (!/^[a-z][\w.+-]*:\/\//i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
   try {
-    const url = new URL(value);
+    const url = new URL(candidate);
     if (url.pathname.endsWith('/chat/completions')) {
       url.pathname = url.pathname.replace(/\/chat\/completions$/, '');
     }
@@ -45,7 +71,7 @@ const sanitizeBaseUrl = (value) => {
     url.hash = '';
     return url.href.replace(/\/$/, '');
   } catch {
-    return value.replace(/\/chat\/completions$/, '').replace(/\/$/, '');
+    return '';
   }
 };
 
@@ -79,16 +105,6 @@ const AGORA_CHANNEL = import.meta.env.VITE_AGORA_CHANNEL;
 const AGORA_TOKEN = import.meta.env.VITE_AGORA_TEMP_TOKEN || null;
 const parsedAgoraUid = Number.parseInt(import.meta.env.VITE_AGORA_UID ?? '', 10);
 const AGORA_UID = Number.isFinite(parsedAgoraUid) ? parsedAgoraUid : null;
-const AGORA_AGENT_LAST_JOIN_KEY = 'agora-agent-last-join';
-const AGENT_CONTROLLER_URL =
-  import.meta.env.VITE_AGENT_CONTROLLER_URL ?? import.meta.env.VITE_AI_AGENT_SERVER_URL ?? '';
-const AGENT_LEAVE_ENDPOINT = AGENT_CONTROLLER_URL
-  ? `${AGENT_CONTROLLER_URL.replace(/\/$/, '')}/agent/leave`
-  : '';
-const AGENT_CONTROLLER_AUTH_TOKEN =
-  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_TOKEN ??
-  import.meta.env.VITE_AGENT_CONTROLLER_AUTH_SECRET ??
-  '';
 
 const checklistDefinitionsById = initialChecklist.reduce((acc, item) => {
   acc[item.id] = item;
@@ -126,10 +142,15 @@ const CallPage = () => {
   const remoteAudioTracksRef = useRef(new Map());
   const agoraSessionContextRef = useRef(null);
   const hasResetChecklistRef = useRef(false);
-  const agentSpeakingRef = useRef(false);
-  const agentSilenceTimeoutRef = useRef(null);
-  const agentAudioMonitorRef = useRef(null);
   const resumeListeningTimeoutRef = useRef(null);
+  const agentJoinStateRef = useRef({
+    status: 'idle',
+    retryTimer: null,
+    attempts: 0,
+    warnedMissingEndpoint: false,
+    warnedMissingPayload: false
+  });
+  const isAgentConnectedRef = useRef(false);
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   const [callTone, setCallTone] = useState('idle');
   const [statusLabel, setStatusLabel] = useState('Agent not connected');
@@ -157,35 +178,9 @@ const CallPage = () => {
     callActiveRef.current = callActive;
   }, [callActive]);
 
-  const applyAgentActivityUi = useCallback(
-    (activity) => {
-      if (!isComponentMountedRef.current) {
-        return;
-      }
-
-      if (!isAgentConnected) {
-        setStatusLabel('Agent not connected');
-        setCallTone('idle');
-        return;
-      }
-
-      if (activity === 'speaking') {
-        setStatusLabel('Agent speaking');
-        setCallTone('speaking');
-        return;
-      }
-
-      if (activity === 'listening') {
-        setStatusLabel('Agent listening');
-        setCallTone('listening');
-        return;
-      }
-
-      setStatusLabel('Agent connected');
-      setCallTone('connected');
-    },
-    [isAgentConnected]
-  );
+  useEffect(() => {
+    isAgentConnectedRef.current = isAgentConnected;
+  }, [isAgentConnected]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.sessionStorage === 'undefined') {
@@ -258,17 +253,178 @@ const CallPage = () => {
   }, []);
 
   useEffect(() => {
+    const state = agentJoinStateRef.current;
+
+    const clearRetryTimer = () => {
+      if (state.retryTimer !== null) {
+        clearTimeout(state.retryTimer);
+        state.retryTimer = null;
+      }
+    };
+
+    if (!callActive || isAgentConnected) {
+      clearRetryTimer();
+      state.status = 'idle';
+      state.attempts = 0;
+      state.warnedMissingEndpoint = false;
+      state.warnedMissingPayload = false;
+      return undefined;
+    }
+
+    if (!AGENT_JOIN_ENDPOINT) {
+      if (!state.warnedMissingEndpoint) {
+        console.warn(
+          'Missing agent controller endpoint. Agent will remain disconnected until configured.'
+        );
+        state.warnedMissingEndpoint = true;
+      }
+      state.status = 'blocked';
+      return undefined;
+    }
+
+    state.warnedMissingEndpoint = false;
+
+    if (state.status === 'attempting' || state.status === 'awaiting') {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const scheduleRetry = (delay, { resetAttempts = false } = {}) => {
+      clearRetryTimer();
+      if (cancelled) return;
+
+      if (resetAttempts) {
+        state.attempts = 0;
+      } else {
+        state.attempts += 1;
+      }
+
+      state.retryTimer = window.setTimeout(() => {
+        state.retryTimer = null;
+        if (cancelled || !callActiveRef.current) {
+          state.status = 'idle';
+          state.attempts = 0;
+          return;
+        }
+        if (isAgentConnectedRef.current) {
+          state.status = 'idle';
+          state.attempts = 0;
+          return;
+        }
+        state.status = 'idle';
+        void attemptJoin();
+      }, delay);
+    };
+
+    const attemptJoin = async () => {
+      if (cancelled || state.status === 'attempting') {
+        return;
+      }
+
+      const payload = buildAgentJoinRequest();
+      if (!payload) {
+        if (!state.warnedMissingPayload) {
+          console.warn(
+            'Unable to build agent join request payload. Agent will remain disconnected.'
+          );
+          state.warnedMissingPayload = true;
+        }
+        state.status = 'blocked';
+        return;
+      }
+
+      state.warnedMissingPayload = false;
+      state.status = 'attempting';
+
+      const result = await requestAgentJoin(payload);
+      if (cancelled) {
+        return;
+      }
+
+      if (!result.ok) {
+        if (result.status === 409) {
+          const identifiers = resolveAgentIdentifiers(result.parsedBody);
+
+          if (identifiers?.agentId) {
+            persistAgentSessionDetails({
+              agentId: identifiers.agentId,
+              projectId: identifiers.projectId,
+              leaveUrl: identifiers.leaveUrl,
+              recordedAt: Date.now()
+            });
+            setIsAgentConnected(true);
+          } else {
+            console.warn(
+              'Agent controller join conflict response did not include an agent identifier.'
+            );
+          }
+
+          state.status = 'awaiting';
+          scheduleRetry(4000, { resetAttempts: true });
+          return;
+        }
+
+        state.status = 'idle';
+
+        if (result.error) {
+          console.error('Failed to invoke agent controller join request', result.error);
+        } else if (result.reason === 'missing_configuration') {
+          console.error('Agent controller join failed: configuration is missing.');
+          state.status = 'blocked';
+          return;
+        } else if (result.reason === 'missing_payload') {
+          console.error('Agent controller join failed: payload could not be constructed.');
+          state.status = 'blocked';
+          return;
+        } else if (result.reason === 'fetch_unavailable') {
+          console.error('Agent controller join failed: Fetch API unavailable in this environment.');
+        } else {
+          console.error('Agent controller join request failed', {
+            status: result.status,
+            statusText: result.statusText,
+            body: result.body
+          });
+        }
+
+        const nextDelay = Math.min(15000, 3000 * Math.max(1, state.attempts + 1));
+        scheduleRetry(nextDelay);
+        return;
+      }
+
+      if (result.parsedBody === undefined && result.body) {
+        console.warn('Agora agent join response returned non-JSON content.');
+      }
+
+      if (!result.sessionDetails) {
+        console.warn(
+          'Agora agent join response missing agent identifier. Leave request may be skipped.'
+        );
+      }
+
+      state.status = 'awaiting';
+      scheduleRetry(5000, { resetAttempts: true });
+    };
+
+    void attemptJoin();
+
+    return () => {
+      cancelled = true;
+      clearRetryTimer();
+      state.status = 'idle';
+    };
+  }, [callActive, isAgentConnected]);
+
+  useEffect(() => {
     if (!isAgentConnected) {
       setStatusLabel('Agent not connected');
       setCallTone('idle');
       return;
     }
-    if (agentSpeakingRef.current) {
-      applyAgentActivityUi('speaking');
-    } else {
-      applyAgentActivityUi('listening');
-    }
-  }, [applyAgentActivityUi, isAgentConnected]);
+
+    setStatusLabel('Agent connected');
+    setCallTone('connected');
+  }, [isAgentConnected]);
 
   useEffect(() => {
     checklistApiBaseRef.current = checklistApiBase;
@@ -578,9 +734,6 @@ const CallPage = () => {
 
     recognition.onend = () => {
       if (!callActiveRef.current) return;
-      if (agentSpeakingRef.current) {
-        return;
-      }
       if (resumeListeningTimeoutRef.current === null) {
         scheduleResumeListening();
       }
@@ -612,24 +765,54 @@ const CallPage = () => {
 
         const existingEntry = remoteTracksForSession.get(user.uid);
         const existingTrack = existingEntry?.track;
-        if (existingTrack) {
-          stopAgentAudioMonitor({ track: existingTrack, immediate: false });
-          if (typeof existingTrack.off === 'function' && existingEntry.onPlayerStateChange) {
-            existingTrack.off('player-state-change', existingEntry.onPlayerStateChange);
-          }
-          try {
-            existingTrack.stop();
-          } catch (error) {
-            console.error('Failed to stop previous remote Agora track', error);
-          }
+        const existingCleanup = existingEntry?.cleanup;
+        const existingStateChange = existingEntry?.onPlayerStateChange;
+
+        let pendingPreviousTrackStop = null;
+
+        if (existingEntry?.cleanupTimer && typeof window !== 'undefined') {
+          window.clearTimeout(existingEntry.cleanupTimer);
+          existingEntry.cleanupTimer = null;
         }
 
-        const canMonitorLevel = typeof remoteAudioTrack.getAudioLevel === 'function';
+        if (existingTrack && existingTrack === remoteAudioTrack) {
+          if (typeof existingTrack.off === 'function' && existingStateChange) {
+            existingTrack.off('player-state-change', existingStateChange);
+          }
+        } else if (existingCleanup) {
+          pendingPreviousTrackStop = () => existingCleanup({ removeEntry: true });
+        } else if (existingTrack) {
+          pendingPreviousTrackStop = () => {
+            if (typeof existingTrack.off === 'function' && existingStateChange) {
+              existingTrack.off('player-state-change', existingStateChange);
+            }
+            try {
+              existingTrack.stop();
+            } catch (error) {
+              console.error('Failed to stop previous remote Agora track', error);
+            }
+            if (remoteTracksForSession.get(user.uid) === existingEntry) {
+              remoteTracksForSession.delete(user.uid);
+            }
+          };
+        }
+
+        const stopPreviousTrackIfPending = () => {
+          if (!pendingPreviousTrackStop) {
+            return;
+          }
+          pendingPreviousTrackStop();
+          pendingPreviousTrackStop = null;
+        };
+
+        let hasNewTrackStarted = false;
+
         const handlePlayerStateChange = (state) => {
           if (state === 'playing') {
-            handleAgentSpeakingChange(true);
+            hasNewTrackStarted = true;
+            stopPreviousTrackIfPending();
           } else if (
-            !canMonitorLevel &&
+            hasNewTrackStarted &&
             (state === 'stopped' ||
               state === 'paused' ||
               state === 'idle' ||
@@ -637,18 +820,44 @@ const CallPage = () => {
               state === 'failed' ||
               state === 'aborted')
           ) {
-            handleAgentSpeakingChange(false);
+            stopPreviousTrackIfPending();
           }
         };
 
         remoteAudioTrack.on('player-state-change', handlePlayerStateChange);
         remoteAudioTrack.play();
-        handleAgentSpeakingChange(true);
-        remoteTracksForSession.set(user.uid, {
+
+        let cleaned = false;
+        const remoteTrackEntry = {
           track: remoteAudioTrack,
-          onPlayerStateChange: handlePlayerStateChange
-        });
-        startAgentAudioMonitor(remoteAudioTrack);
+          onPlayerStateChange: handlePlayerStateChange,
+          cleanupTimer: null,
+          cleanup: null
+        };
+
+        remoteTrackEntry.cleanup = ({ removeEntry = true } = {}) => {
+          if (cleaned) {
+            return;
+          }
+          cleaned = true;
+          if (remoteTrackEntry.cleanupTimer && typeof window !== 'undefined') {
+            window.clearTimeout(remoteTrackEntry.cleanupTimer);
+            remoteTrackEntry.cleanupTimer = null;
+          }
+          if (typeof remoteAudioTrack.off === 'function') {
+            remoteAudioTrack.off('player-state-change', handlePlayerStateChange);
+          }
+          try {
+            remoteAudioTrack.stop();
+          } catch (error) {
+            console.error('Failed to stop remote Agora track', error);
+          }
+          if (removeEntry && remoteTracksForSession.get(user.uid) === remoteTrackEntry) {
+            remoteTracksForSession.delete(user.uid);
+          }
+        };
+
+        remoteTracksForSession.set(user.uid, remoteTrackEntry);
       } catch (error) {
         console.error('Failed to subscribe to remote audio', error);
       }
@@ -656,20 +865,44 @@ const CallPage = () => {
 
     const handleRemoteAudioRemoved = (user) => {
       const entry = remoteTracksForSession.get(user.uid);
-      if (entry?.track) {
-        stopAgentAudioMonitor({ track: entry.track });
-        if (typeof entry.track.off === 'function' && entry.onPlayerStateChange) {
-          entry.track.off('player-state-change', entry.onPlayerStateChange);
-        }
-        try {
-          entry.track.stop();
-        } catch (error) {
-          console.error('Failed to stop remote Agora track', error);
-        }
+      if (!entry) {
+        return;
       }
-      remoteTracksForSession.delete(user.uid);
-      if (remoteTracksForSession.size === 0) {
-        handleAgentSpeakingChange(false);
+
+      if (entry.cleanupTimer && typeof window !== 'undefined') {
+        window.clearTimeout(entry.cleanupTimer);
+        entry.cleanupTimer = null;
+      }
+
+      const executeCleanup = () => {
+        if (entry.cleanup) {
+          entry.cleanup({ removeEntry: true });
+          return;
+        }
+
+        const track = entry.track;
+        if (track) {
+          if (typeof track.off === 'function' && entry.onPlayerStateChange) {
+            track.off('player-state-change', entry.onPlayerStateChange);
+          }
+          try {
+            track.stop();
+          } catch (error) {
+            console.error('Failed to stop remote Agora track', error);
+          }
+        }
+
+        if (remoteTracksForSession.get(user.uid) === entry) {
+          remoteTracksForSession.delete(user.uid);
+        }
+      };
+
+      if (typeof window !== 'undefined') {
+        entry.cleanupTimer = window.setTimeout(() => {
+          executeCleanup();
+        }, REMOTE_TRACK_REPLACEMENT_GRACE_MS);
+      } else {
+        executeCleanup();
       }
     };
 
@@ -713,9 +946,7 @@ const CallPage = () => {
     return () => {
       recognition.stop();
       callActiveRef.current = false;
-      clearAgentSilenceTimeout();
       clearResumeListeningTimeout();
-      stopAgentAudioMonitor({ immediate: false });
       stopVolumeMonitor();
       stopLocalStream();
       client.off('user-published', handleRemoteAudioPublished);
@@ -819,11 +1050,17 @@ const CallPage = () => {
     }
 
     tracks?.forEach((entry, uid) => {
-      const remoteTrack = entry?.track;
+      if (!entry) {
+        return;
+      }
+      if (entry.cleanup) {
+        entry.cleanup({ removeEntry: false });
+        return;
+      }
+      const remoteTrack = entry.track;
       if (!remoteTrack) {
         return;
       }
-      stopAgentAudioMonitor({ track: remoteTrack });
       if (typeof remoteTrack.off === 'function' && entry.onPlayerStateChange) {
         remoteTrack.off('player-state-change', entry.onPlayerStateChange);
       }
@@ -833,13 +1070,10 @@ const CallPage = () => {
         console.error(`Failed to stop remote Agora track for user ${uid}`, error);
       }
     });
-    stopAgentAudioMonitor();
     tracks?.clear();
     if (tracks && remoteAudioTracksRef.current === tracks) {
       remoteAudioTracksRef.current = new Map();
     }
-    clearAgentSilenceTimeout();
-    agentSpeakingRef.current = false;
     clearResumeListeningTimeout();
 
     if (client) {
@@ -1096,9 +1330,6 @@ const CallPage = () => {
   const greetAndStart = () => {
     if (!callActiveRef.current || hasGreetedRef.current) return;
     hasGreetedRef.current = true;
-    if (agentSpeakingRef.current) {
-      return;
-    }
     scheduleResumeListening(200);
   };
 
@@ -1126,148 +1357,15 @@ const CallPage = () => {
     }
   };
 
-  const clearAgentSilenceTimeout = () => {
-    if (agentSilenceTimeoutRef.current !== null) {
-      clearTimeout(agentSilenceTimeoutRef.current);
-      agentSilenceTimeoutRef.current = null;
-    }
-  };
-
   const scheduleResumeListening = (delay = 400) => {
     clearResumeListeningTimeout();
     resumeListeningTimeoutRef.current = setTimeout(() => {
       resumeListeningTimeoutRef.current = null;
-      if (!callActiveRef.current || agentSpeakingRef.current) {
+      if (!callActiveRef.current) {
         return;
       }
       startListening();
     }, delay);
-  };
-
-  const handleAgentSpeakingChange = (isSpeaking, options = {}) => {
-    const { immediate = false } = options;
-
-    if (isSpeaking) {
-      if (!agentSpeakingRef.current) {
-        agentSpeakingRef.current = true;
-      }
-      clearAgentSilenceTimeout();
-      if (!isComponentMountedRef.current) {
-        return;
-      }
-      applyAgentActivityUi('speaking');
-      clearResumeListeningTimeout();
-      stopListening();
-      return;
-    }
-
-    if (!agentSpeakingRef.current) {
-      return;
-    }
-
-    if (immediate) {
-      clearAgentSilenceTimeout();
-      agentSpeakingRef.current = false;
-      if (isComponentMountedRef.current) {
-        applyAgentActivityUi('listening');
-      }
-      if (callActiveRef.current) {
-        scheduleResumeListening(AGENT_LISTENING_RESUME_DELAY_MS);
-      }
-      return;
-    }
-
-    if (!isComponentMountedRef.current) {
-      agentSpeakingRef.current = false;
-      return;
-    }
-
-    if (agentSilenceTimeoutRef.current !== null) {
-      return;
-    }
-
-    agentSilenceTimeoutRef.current = setTimeout(() => {
-      agentSilenceTimeoutRef.current = null;
-      agentSpeakingRef.current = false;
-      if (!isComponentMountedRef.current) {
-        return;
-      }
-      applyAgentActivityUi('listening');
-      if (callActiveRef.current) {
-        scheduleResumeListening(AGENT_LISTENING_RESUME_DELAY_MS);
-      }
-    }, AGENT_SILENCE_DEBOUNCE_MS);
-  };
-
-  const stopAgentAudioMonitor = ({ immediate = true, track } = {}) => {
-    const monitor = agentAudioMonitorRef.current;
-    if (monitor && track && monitor.track && monitor.track !== track) {
-      return;
-    }
-
-    if (typeof window !== 'undefined' && monitor?.timer !== undefined && monitor?.timer !== null) {
-      window.clearInterval(monitor.timer);
-    }
-
-    if (!monitor || !track || !monitor.track || monitor.track === track) {
-      agentAudioMonitorRef.current = null;
-    }
-
-    if (immediate) {
-      handleAgentSpeakingChange(false, { immediate: true });
-    }
-  };
-
-  const startAgentAudioMonitor = (remoteAudioTrack) => {
-    if (typeof window === 'undefined' || !remoteAudioTrack) {
-      return;
-    }
-
-    const wasSpeaking = agentSpeakingRef.current;
-    stopAgentAudioMonitor({ immediate: false });
-
-    if (typeof remoteAudioTrack.getAudioLevel !== 'function') {
-      if (wasSpeaking) {
-        handleAgentSpeakingChange(true);
-      }
-      return;
-    }
-
-    const monitorState = {
-      timer: null,
-      isSpeaking: wasSpeaking,
-      lastActiveAt: Date.now(),
-      track: remoteAudioTrack
-    };
-
-    const pollAudioLevel = () => {
-      const level = remoteAudioTrack.getAudioLevel?.() ?? 0;
-      const now = Date.now();
-      const threshold = monitorState.isSpeaking
-        ? AGENT_AUDIO_INACTIVE_THRESHOLD
-        : AGENT_AUDIO_ACTIVE_THRESHOLD;
-
-      if (level >= threshold) {
-        monitorState.lastActiveAt = now;
-        if (!monitorState.isSpeaking) {
-          monitorState.isSpeaking = true;
-          handleAgentSpeakingChange(true);
-        }
-        return;
-      }
-
-      if (
-        monitorState.isSpeaking &&
-        now - monitorState.lastActiveAt >= AGENT_AUDIO_SILENCE_DURATION
-      ) {
-        monitorState.isSpeaking = false;
-        handleAgentSpeakingChange(false);
-      }
-    };
-
-    monitorState.timer = window.setInterval(pollAudioLevel, AGENT_AUDIO_LEVEL_INTERVAL);
-    agentAudioMonitorRef.current = monitorState;
-    pollAudioLevel();
   };
 
   const handleUserSpeech = async (text) => {
@@ -1285,11 +1383,6 @@ const CallPage = () => {
     setIsProcessing(false);
 
     if (!callActiveRef.current) return;
-
-    if (agentSpeakingRef.current) {
-      return;
-    }
-
     scheduleResumeListening();
   };
 
@@ -1298,9 +1391,7 @@ const CallPage = () => {
       return;
     }
     recognitionRef.current?.stop();
-    clearAgentSilenceTimeout();
     clearResumeListeningTimeout();
-    agentSpeakingRef.current = false;
   }, [callActive, isChecklistComplete]);
 
   const handleDownload = () => {
@@ -1398,9 +1489,7 @@ const CallPage = () => {
 
   const handleEndCall = async () => {
     callActiveRef.current = false;
-    clearAgentSilenceTimeout();
     clearResumeListeningTimeout();
-    agentSpeakingRef.current = false;
     setCallActive(false);
     stopListening();
     stopVolumeMonitor();

@@ -4,6 +4,8 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   server: {
-    open: true
+    host: true,
+    open: false,
+    allowedHosts: ['healthcheck.stellarix.space']
   }
 });
