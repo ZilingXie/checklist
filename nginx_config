@@ -1,0 +1,60 @@
+  server {
+      listen 443 ssl http2;
+      server_name healthcheck.stellarix.space;
+
+      location ^~ /.well-known/acme-challenge/ {
+          root /var/www/certbot;
+          try_files $uri =404;
+      }
+
+      location /agent/ {
+          proxy_pass http://127.0.0.1:3002;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header Connection "";
+          proxy_read_timeout 300;
+      }
+
+      location /custom-llm/ {
+          proxy_pass http://127.0.0.1:3100/;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header Connection "";
+          proxy_buffering off;
+          proxy_read_timeout 600;
+      }
+
+      location / {
+          proxy_pass http://127.0.0.1:5173/;
+          proxy_http_version 1.1;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+          proxy_read_timeout 300;
+      }
+
+      ssl_certificate /etc/letsencrypt/live/healthcheck.stellarix.space/fullchain.pem;
+      ssl_certificate_key /etc/letsencrypt/live/healthcheck.stellarix.space/privkey.pem;
+      include /etc/letsencrypt/options-ssl-nginx.conf;
+      ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+  }
+
+  server {
+      listen 80;
+      server_name healthcheck.stellarix.space;
+
+      if ($host = healthcheck.stellarix.space) {
+          return 301 https://$host$request_uri;
+      }
+
+      return 404;
+  }
