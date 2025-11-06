@@ -124,6 +124,32 @@ const normalizeChecklistItems = (items) =>
     };
   });
 
+const completedChecklistStatuses = new Set(['pass', 'fail', 'warning', 'complete']);
+
+const isChecklistItemFinished = (item) => {
+  if (!item || typeof item.status !== 'string') {
+    return false;
+  }
+
+  const normalizedStatus = item.status.trim().toLowerCase();
+  return Boolean(normalizedStatus) && completedChecklistStatuses.has(normalizedStatus);
+};
+
+const hasCompletedRequiredChecklistItems = (items) => {
+  if (!Array.isArray(items)) {
+    return false;
+  }
+
+  const lookup = new Map();
+
+  for (const item of items) {
+    if (!item || !item.id) continue;
+    lookup.set(item.id, item);
+  }
+
+  return initialChecklist.every(({ id }) => isChecklistItemFinished(lookup.get(id)));
+};
+
 const CallPage = () => {
   const navigate = useNavigate();
   const checklistApiBase = useMemo(() => resolveChecklistApiBase(), []);
@@ -168,7 +194,7 @@ const CallPage = () => {
   const [agoraJoined, setAgoraJoined] = useState(false);
   const [isAgentConnected, setIsAgentConnected] = useState(false);
 
-  const isChecklistComplete = checklist.every((item) => item.status !== 'pending');
+  const isChecklistComplete = hasCompletedRequiredChecklistItems(checklist);
 
   useEffect(() => {
     selectedDeviceIdRef.current = selectedDeviceId;
