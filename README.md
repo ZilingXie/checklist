@@ -26,6 +26,16 @@ npm run dev
 
 The dev server opens automatically. Grant microphone access and use a supported browser (Chrome, Edge, or Safari) to test the speech features.
 
+## PM2 Deployment
+
+Run the production services under PM2 using the checklist repo path:
+
+```bash
+pm2 start npm --name frontend --cwd /home/ubuntu/checklist -- run dev -- --host 0.0.0.0 --port 5173
+pm2 start /home/ubuntu/checklist/server.js --name server
+pm2 start /home/ubuntu/checklist/customllm.js --name customllm
+```
+
 ## Production Build
 
 ```bash
