@@ -2,6 +2,8 @@
 
 React + Vite single-page application that delivers a two-step experience for running conversational checklist reviews with an AI assistant. Tailwind CSS drives the styling, while the Web Speech API powers live speech recognition and synthesis.
 
+Visit at: https://healthcheck.stellarix.space/
+
 ## Stack
 
 - React 18 with Vite build tooling
