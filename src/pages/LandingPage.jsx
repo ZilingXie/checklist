@@ -1,15 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 
-import {
-  AGENT_JOIN_ENDPOINT,
-  buildAgentJoinRequest,
-  clearAgentSessionDetails,
-  persistAgentSessionDetails,
-  requestAgentJoin,
-  resolveAgentIdentifiers
-} from '../utils/agentSession.js';
-
 const LandingPage = () => {
   const overviewRef = useRef(null);
   const highlightTimeoutRef = useRef(null);
@@ -42,83 +33,6 @@ const LandingPage = () => {
     }, 1600);
   };
 
-  const sendAgentJoinRequest = async () => {
-    if (!AGENT_JOIN_ENDPOINT) {
-      console.warn('Missing agent controller endpoint. Skipping agent join request.');
-      return;
-    }
-
-    const payload = buildAgentJoinRequest();
-    if (!payload) {
-      console.warn('Unable to build agent join request payload. Skipping agent join request.');
-      return;
-    }
-
-    clearAgentSessionDetails();
-
-    const attemptJoin = async ({ allowConflictRetry = true } = {}) => {
-      const result = await requestAgentJoin(payload);
-
-      if (!result.ok) {
-        if (result.status === 409) {
-          const identifiers = resolveAgentIdentifiers(result.parsedBody);
-
-          if (identifiers?.agentId) {
-            persistAgentSessionDetails({
-              agentId: identifiers.agentId,
-              projectId: identifiers.projectId,
-              leaveUrl: identifiers.leaveUrl,
-              recordedAt: Date.now()
-            });
-            return true;
-          } else {
-            console.warn(
-              'Agent controller join conflict response did not include an agent identifier.'
-            );
-          }
-
-          if (allowConflictRetry) {
-            await new Promise((resolve) => setTimeout(resolve, 1500));
-            return attemptJoin({ allowConflictRetry: false });
-          }
-        }
-
-        if (result.error) {
-          console.error('Failed to invoke agent controller join request', result.error);
-        } else if (result.reason === 'missing_configuration') {
-          console.error('Agent controller join failed: configuration is missing.');
-        } else if (result.reason === 'missing_payload') {
-          console.error('Agent controller join failed: payload could not be constructed.');
-        } else if (result.reason === 'fetch_unavailable') {
-          console.error('Agent controller join failed: Fetch API unavailable in this environment.');
-        } else {
-          console.error('Agent controller join request failed', {
-            status: result.status,
-            statusText: result.statusText,
-            body: result.body
-          });
-        }
-        return false;
-      }
-
-      if (result.parsedBody === undefined && result.body) {
-        console.warn('Agora agent join response returned non-JSON content.');
-      }
-
-      if (!result.sessionDetails) {
-        console.warn('Agora agent join response missing agent identifier. Leave request will be skipped.');
-      }
-
-      return true;
-    };
-
-    await attemptJoin();
-  };
-
-  const handleJoinCallClick = () => {
-    void sendAgentJoinRequest();
-  };
-
   return (
     <div className="relative min-h-screen overflow-hidden bg-gradient-to-br from-slate-925 via-slate-900 to-brand-700">
       <div className="absolute inset-0 opacity-40">
@@ -141,7 +55,6 @@ const LandingPage = () => {
           <Link
             to="/call"
             className="rounded-full bg-white px-8 py-3 text-base font-semibold text-slate-925 shadow-lg shadow-brand-700/40 transition hover:translate-y-0.5 hover:bg-brand-500 hover:text-white"
-            onClick={handleJoinCallClick}
           >
             Join Call
           </Link>

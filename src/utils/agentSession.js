@@ -14,10 +14,50 @@ const AGORA_AGENT_IDLE_TIMEOUT = Number.parseInt(
 );
 const AGORA_AGENT_ASR_LANGUAGE = import.meta.env.VITE_AGORA_AGENT_ASR_LANGUAGE ?? 'en-US';
 
-const AGENT_CONTROLLER_URL =
-  import.meta.env.VITE_AGENT_CONTROLLER_URL ??
-  import.meta.env.VITE_AI_AGENT_SERVER_URL ??
-  '';
+const LOCALHOST_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1']);
+
+const isLocalHostname = (value) => LOCALHOST_HOSTNAMES.has(String(value ?? '').toLowerCase());
+
+const resolveBrowserLocation = () => {
+  if (typeof window === 'undefined' || !window.location) {
+    return { origin: '', hostname: '' };
+  }
+
+  return {
+    origin: window.location.origin ?? '',
+    hostname: window.location.hostname ?? ''
+  };
+};
+
+const resolveAgentControllerBaseUrl = () => {
+  const configuredValue =
+    import.meta.env.VITE_AGENT_CONTROLLER_URL ??
+    import.meta.env.VITE_AI_AGENT_SERVER_URL ??
+    '';
+  const configured = String(configuredValue ?? '').trim();
+
+  const { origin, hostname } = resolveBrowserLocation();
+
+  if (configured) {
+    try {
+      const parsed = new URL(configured, origin || 'http://localhost');
+      if (origin && hostname && isLocalHostname(parsed.hostname) && !isLocalHostname(hostname)) {
+        return `${origin}/agent`;
+      }
+      return parsed.toString();
+    } catch {
+      return configured;
+    }
+  }
+
+  if (origin) {
+    return `${origin}/agent`;
+  }
+
+  return '';
+};
+
+const AGENT_CONTROLLER_URL = resolveAgentControllerBaseUrl();
 
 const fallbackProjectId =
   AGORA_APP_ID !== undefined && AGORA_APP_ID !== null && AGORA_APP_ID !== ''

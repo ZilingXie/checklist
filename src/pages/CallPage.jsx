@@ -380,6 +380,10 @@ const CallPage = () => {
               recordedAt: Date.now()
             });
             setIsAgentConnected(true);
+            state.status = 'idle';
+            state.attempts = 0;
+            clearRetryTimer();
+            return;
           } else {
             console.warn(
               'Agent controller join conflict response did not include an agent identifier.'
@@ -420,6 +424,14 @@ const CallPage = () => {
 
       if (result.parsedBody === undefined && result.body) {
         console.warn('Agora agent join response returned non-JSON content.');
+      }
+
+      if (result.sessionDetails) {
+        setIsAgentConnected(true);
+        state.status = 'idle';
+        state.attempts = 0;
+        clearRetryTimer();
+        return;
       }
 
       if (!result.sessionDetails) {
